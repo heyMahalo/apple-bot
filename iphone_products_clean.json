@@ -1,0 +1,132 @@
+{
+  "iPhone 16 Pro & iPhone 16 Pro Max": {
+    "name": "iPhone 16 Pro & iPhone 16 Pro Max",
+    "url": "https://www.apple.com/uk/shop/buy-iphone/iphone-16-pro",
+    "category": "iPhone",
+    "configurations": {
+      "Model": [
+        "iPhone 16 Pro 6.3-inch display",
+        "iPhone 16 Pro Max 6.9-inch display"
+      ],
+      "Finish": [
+        "Desert Titanium",
+        "Natural Titanium",
+        "White Titanium",
+        "Black Titanium"
+      ],
+      "Storage": [
+        "128GB",
+        "256GB",
+        "512GB",
+        "1TB"
+      ],
+      "AppleCare": [
+        "Monthly coverage until cancelled",
+        "Two years of coverage"
+      ]
+    },
+    "pricing": {
+      "128GB": "£999",
+      "256GB": "£1099",
+      "512GB": "£1299"
+    },
+    "models": [
+      "iPhone 16 Pro 6",
+      "iPhone 16 Pro Max 6"
+    ],
+    "colors": [
+      "Desert Titanium",
+      "Natural Titanium",
+      "White Titanium",
+      "Black Titanium"
+    ],
+    "storage_options": [
+      "128GB",
+      "256GB",
+      "512GB"
+    ]
+  },
+  "iPhone 16 & iPhone 16 Plus": {
+    "name": "iPhone 16 & iPhone 16 Plus",
+    "url": "https://www.apple.com/uk/shop/buy-iphone/iphone-16e",
+    "category": "iPhone",
+    "configurations": {
+      "Finish": [
+        "White",
+        "Black"
+      ],
+      "Storage": [
+        "128GB",
+        "256GB",
+        "512GB"
+      ],
+      "AppleCare": [
+        "Monthly coverage until cancelled",
+        "Two years of coverage"
+      ]
+    },
+    "pricing": {
+      "128GB": "£599",
+      "256GB": "£699",
+      "512GB": "£899"
+    },
+    "models": [],
+    "colors": [
+      "White",
+      "Black"
+    ],
+    "storage_options": [
+      "128GB",
+      "256GB",
+      "512GB"
+    ]
+  },
+  "iPhone 15 & iPhone 15 Plus": {
+    "name": "iPhone 15 & iPhone 15 Plus",
+    "url": "https://www.apple.com/uk/shop/buy-iphone/iphone-15",
+    "category": "iPhone",
+    "configurations": {
+      "Model": [
+        "iPhone 15 6.1-inch display",
+        "iPhone 15 Plus 6.7-inch display"
+      ],
+      "Finish": [
+        "Blue",
+        "Pink",
+        "Yellow",
+        "Green",
+        "Black"
+      ],
+      "Storage": [
+        "128GB",
+        "256GB",
+        "512GB"
+      ],
+      "AppleCare": [
+        "Monthly coverage until cancelled",
+        "Two years of coverage"
+      ]
+    },
+    "pricing": {
+      "128GB": "£699",
+      "256GB": "£799",
+      "512GB": "£999"
+    },
+    "models": [
+      "iPhone 15 6",
+      "iPhone 15 Plus 6"
+    ],
+    "colors": [
+      "Blue",
+      "Pink",
+      "Yellow",
+      "Green",
+      "Black"
+    ],
+    "storage_options": [
+      "128GB",
+      "256GB",
+      "512GB"
+    ]
+  }
+}

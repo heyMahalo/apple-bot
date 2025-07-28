@@ -1,0 +1,79 @@
+{
+  "models": {
+    "iphone-16-pro": {
+      "name": "iPhone 16 Pro",
+      "sizes": {
+        "6.3-inch-display": {
+          "name": "iPhone 16 Pro (6.3\")",
+          "storages": ["128gb", "256gb", "512gb", "1tb"],
+          "colors": ["desert-titanium", "natural-titanium", "white-titanium", "black-titanium"]
+        },
+        "6.9-inch-display": {
+          "name": "iPhone 16 Pro Max (6.9\")",
+          "storages": ["256gb", "512gb", "1tb"],
+          "colors": ["desert-titanium", "natural-titanium", "white-titanium", "black-titanium"]
+        }
+      }
+    },
+    "iphone-16": {
+      "name": "iPhone 16",
+      "sizes": {
+        "6.1-inch-display": {
+          "name": "iPhone 16 (6.1\")",
+          "storages": ["128gb", "256gb", "512gb"],
+          "colors": ["ultramarine", "teal", "pink", "white", "black"]
+        },
+        "6.7-inch-display": {
+          "name": "iPhone 16 Plus (6.7\")",
+          "storages": ["128gb", "256gb", "512gb"],
+          "colors": ["ultramarine", "teal", "pink", "white", "black"]
+        }
+      }
+    },
+    "iphone-16e": {
+      "name": "iPhone 16e",
+      "sizes": {
+        "6.1-inch-display": {
+          "name": "iPhone 16e (6.1\")",
+          "storages": ["128gb", "256gb", "512gb"],
+          "colors": ["white", "black"]
+        }
+      }
+    },
+    "iphone-15": {
+      "name": "iPhone 15",
+      "sizes": {
+        "6.1-inch-display": {
+          "name": "iPhone 15 (6.1\")",
+          "storages": ["128gb", "256gb", "512gb"],
+          "colors": ["blue", "pink", "yellow", "green", "black"]
+        },
+        "6.7-inch-display": {
+          "name": "iPhone 15 Plus (6.7\")",
+          "storages": ["128gb", "256gb", "512gb"],
+          "colors": ["blue", "pink", "yellow", "green", "black"]
+        }
+      }
+    }
+  },
+  "color_display_names": {
+    "desert-titanium": "Desert Titanium",
+    "natural-titanium": "Natural Titanium",
+    "white-titanium": "White Titanium",
+    "black-titanium": "Black Titanium",
+    "ultramarine": "Ultramarine",
+    "teal": "Teal",
+    "pink": "Pink",
+    "white": "White",
+    "black": "Black",
+    "blue": "Blue",
+    "yellow": "Yellow",
+    "green": "Green"
+  },
+  "storage_display_names": {
+    "128gb": "128GB",
+    "256gb": "256GB",
+    "512gb": "512GB",
+    "1tb": "1TB"
+  }
+}
