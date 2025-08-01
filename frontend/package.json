@@ -3,20 +3,19 @@
   "version": "1.0.0",
   "description": "Apple Bot System Frontend",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 8081 --host localhost",
     "build": "vite build",
     "preview": "vite preview",
-    "serve": "vite --host 0.0.0.0 --port 8080"
+    "serve": "vite --host 0.0.0.0 --port 8081"
   },
   "dependencies": {
-    "vue": "^3.3.0",
-    "vuex": "^4.0.2",
-    "socket.io-client": "^4.7.2",
-    "axios": "^1.6.0",
-    "element-plus": "^2.4.0",
-    "@element-plus/icons-vue": "^2.1.0",
-    "dayjs": "^1.11.9"
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.11.0",
+    "element-plus": "^2.10.4",
+    "socket.io-client": "^4.8.1",
+    "vue": "^3.3.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^4.5.0",

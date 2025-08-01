@@ -1,7 +1,10 @@
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask import request
 import logging
+import asyncio
+import time
 from datetime import datetime
+from models.task import TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +13,9 @@ class WebSocketHandler:
         self.socketio = socketio
         self.task_manager = task_manager
         self.connected_clients = set()
+        self.setup_gift_card_handlers()
         self._setup_handlers()
+        self._setup_redis_listeners()
     
     def _setup_handlers(self):
         """设置WebSocket事件处理器"""
@@ -166,10 +171,35 @@ class WebSocketHandler:
             if not task_id:
                 emit('error', {'message': 'Task ID is required'})
                 return
-            
+
+            # 获取任务对象
+            task = self.task_manager.get_task(task_id)
+            if not task:
+                emit('task_start_error', {
+                    'task_id': task_id,
+                    'message': 'Task not found'
+                })
+                return
+
             success = self.task_manager.start_task(task_id, self)
             if success:
+                # 立即发送任务启动成功事件
                 emit('task_start_success', {'task_id': task_id})
+
+                # 🚀 立即广播任务状态更新，确保100%同步
+                updated_task = self.task_manager.get_task(task_id)
+                if updated_task:
+                    self.socketio.emit('task_status_update', {
+                        'task_id': task_id,
+                        'status': updated_task.status.value,
+                        'progress': updated_task.progress,
+                        'message': '任务开始执行'
+                    })
+
+                    # 同时发送完整的任务更新
+                    self.socketio.emit('task_update', updated_task.to_dict())
+
+                    logger.info(f"🚀 立即同步任务状态: {task_id} -> {updated_task.status.value}")
             else:
                 emit('task_start_error', {
                     'task_id': task_id,
@@ -284,3 +314,240 @@ class WebSocketHandler:
             'timestamp': datetime.now().isoformat()
         }
         self.broadcast('task_log', data)
+
+    def send_task_event(self, event_name: str, task_id: str, data: dict = None):
+        """发送任务相关事件"""
+        event_data = {
+            'task_id': task_id,
+            'timestamp': datetime.now().isoformat()
+        }
+        if data:
+            event_data.update(data)
+        
+        self.broadcast(event_name, event_data)
+        logger.info(f"📡 发送任务事件: {event_name} for task {task_id}")
+
+    def setup_gift_card_handlers(self):
+        """设置礼品卡相关的WebSocket处理器"""
+
+        @self.socketio.on('submit_gift_cards')
+        def handle_submit_gift_cards(data):
+            """处理用户提交的礼品卡 - 系统界面输入版本"""
+            try:
+                task_id = data.get('task_id')
+                gift_cards = data.get('gift_cards', [])
+
+                logger.info(f"🎁 收到任务 {task_id} 的系统界面礼品卡提交: {len(gift_cards)} 张")
+
+                # 提取礼品卡号码
+                gift_card_numbers = []
+                for gift_card in gift_cards:
+                    if isinstance(gift_card, dict):
+                        number = gift_card.get('number', '').strip()
+                        if number:
+                            gift_card_numbers.append(number)
+                    elif isinstance(gift_card, str):
+                        gift_card_numbers.append(gift_card.strip())
+
+                if not gift_card_numbers:
+                    emit('gift_card_submit_error', {
+                        'task_id': task_id,
+                        'message': '请输入至少一张礼品卡号码'
+                    })
+                    return
+
+                # 获取任务
+                task = self.task_manager.get_task(task_id)
+                if not task or task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
+                    emit('gift_card_submit_error', {
+                        'task_id': task_id,
+                        'message': '任务状态异常，无法继续执行'
+                    })
+                    return
+
+                # 🚀 异步调用自动化服务继续执行
+                import asyncio
+                import threading
+                
+                def continue_automation():
+                    try:
+                        # 创建新的事件循环
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        # 调用自动化服务继续执行
+                        automation_service = self.task_manager.automation_service
+                        result = loop.run_until_complete(
+                            automation_service.continue_with_gift_card_input(task, gift_card_numbers)
+                        )
+                        
+                        if result:
+                            # 成功消息
+                            self.socketio.emit('gift_card_submit_success', {
+                                'task_id': task_id,
+                                'message': f'已提交 {len(gift_card_numbers)} 张礼品卡，自动化继续执行'
+                            })
+                        else:
+                            # 失败消息
+                            self.socketio.emit('gift_card_submit_error', {
+                                'task_id': task_id,
+                                'message': '礼品卡处理失败，请查看日志'
+                            })
+                        
+                        loop.close()
+                        
+                    except Exception as e:
+                        logger.error(f"❌ 继续自动化执行异常: {str(e)}")
+                        self.socketio.emit('gift_card_submit_error', {
+                            'task_id': task_id,
+                            'message': f'执行异常: {str(e)}'
+                        })
+                
+                # 在后台线程中执行
+                thread = threading.Thread(target=continue_automation, daemon=True)
+                thread.start()
+                
+                # 立即返回确认消息
+                emit('gift_card_submit_success', {
+                    'task_id': task_id,
+                    'message': f'礼品卡已接收，正在处理 {len(gift_card_numbers)} 张'
+                })
+
+            except Exception as e:
+                logger.error(f"❌ 处理礼品卡提交失败: {str(e)}")
+                emit('gift_card_submit_error', {
+                    'task_id': data.get('task_id'),
+                    'message': f'处理失败: {str(e)}'
+                })
+
+    async def _continue_gift_card_application(self, task_id: str, gift_cards: list):
+        """异步继续礼品卡应用"""
+        try:
+            task = self.task_manager.get_task(task_id)
+            if task:
+                # 获取自动化服务实例
+                automation_service = self.task_manager.automation_service
+                if automation_service:
+                    # 继续执行礼品卡应用
+                    success = await automation_service.continue_with_gift_cards(task, gift_cards)
+                    if success:
+                        # 继续执行后续步骤
+                        await self.task_manager.continue_task_execution(task_id)
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.add_log("❌ 礼品卡应用失败，任务终止", "error")
+        except Exception as e:
+            logger.error(f"继续礼品卡应用异常: {str(e)}")
+
+    def _setup_redis_listeners(self):
+        """设置Redis监听器，将Redis消息转发到WebSocket客户端"""
+        try:
+            from services.message_service import get_message_service
+            message_service = get_message_service()
+
+            # 监听任务状态更新
+            def handle_task_status_update(message):
+                logger.info(f"🔄 Redis->WebSocket: 任务状态更新 {message}")
+                self.socketio.emit('task_status_update', message)
+
+                # 🚀 同步更新TaskManager中的任务状态
+                if 'task_id' in message and self.task_manager:
+                    task = self.task_manager.get_task(message['task_id'])
+                    if task:
+                        updated = False
+                        if 'progress' in message and message['progress'] != task.progress:
+                            task.progress = message['progress']
+                            updated = True
+                        if 'status' in message:
+                            # 将字符串状态转换为TaskStatus枚举
+                            from models.task import TaskStatus
+                            status_map = {
+                                'running': TaskStatus.RUNNING,
+                                'stage_1_product_config': TaskStatus.STAGE_1_PRODUCT_CONFIG,
+                                'stage_2_account_login': TaskStatus.STAGE_2_ACCOUNT_LOGIN,
+                                'stage_3_address_phone': TaskStatus.STAGE_3_ADDRESS_PHONE,
+                                'stage_4_gift_card': TaskStatus.STAGE_4_GIFT_CARD,
+                                'waiting_gift_card_input': TaskStatus.WAITING_GIFT_CARD_INPUT,
+                                'completed': TaskStatus.COMPLETED,
+                                'failed': TaskStatus.FAILED,
+                                'cancelled': TaskStatus.CANCELLED
+                            }
+                            new_status = status_map.get(message['status'])
+                            if new_status and new_status != task.status:
+                                task.status = new_status
+                                updated = True
+
+                        if updated:
+                            logger.info(f"✅ TaskManager状态已同步: {message['task_id']} -> 进度:{task.progress}% 状态:{task.status}")
+
+            # 监听步骤更新
+            def handle_step_update(message):
+                logger.info(f"🔄 Redis->WebSocket: 步骤更新 {message}")
+                self.socketio.emit('step_update', message)
+
+                # 🚀 同步更新TaskManager中的任务状态
+                if 'task_id' in message and self.task_manager:
+                    task = self.task_manager.get_task(message['task_id'])
+                    if task:
+                        updated = False
+                        if 'progress' in message and message['progress'] != task.progress:
+                            task.progress = message['progress']
+                            updated = True
+                        if 'step' in message and message['step'] != task.current_step:
+                            task.current_step = message['step']
+                            updated = True
+                        if 'status' in message:
+                            # 将字符串状态转换为TaskStatus枚举
+                            from models.task import TaskStatus
+                            status_map = {
+                                'started': TaskStatus.RUNNING,
+                                'running': TaskStatus.RUNNING,
+                                'stage_1_product_config': TaskStatus.STAGE_1_PRODUCT_CONFIG,
+                                'stage_2_account_login': TaskStatus.STAGE_2_ACCOUNT_LOGIN,
+                                'stage_3_address_phone': TaskStatus.STAGE_3_ADDRESS_PHONE,
+                                'stage_4_gift_card': TaskStatus.STAGE_4_GIFT_CARD,
+                                'waiting_gift_card_input': TaskStatus.WAITING_GIFT_CARD_INPUT,
+                                'completed': TaskStatus.COMPLETED,
+                                'failed': TaskStatus.FAILED,
+                                'cancelled': TaskStatus.CANCELLED
+                            }
+                            new_status = status_map.get(message['status'])
+                            if new_status and new_status != task.status:
+                                task.status = new_status
+                                updated = True
+
+                        if updated:
+                            logger.info(f"✅ TaskManager状态已同步: {message['task_id']} -> 进度:{task.progress}% 状态:{task.status}")
+                        else:
+                            logger.debug(f"ℹ️ TaskManager状态无变化: {message['task_id']}")
+
+            # 监听任务日志
+            def handle_task_log(message):
+                logger.info(f"🔄 Redis->WebSocket: 任务日志 {message}")
+                self.socketio.emit('task_log', message)
+
+            # 监听礼品卡事件
+            def handle_gift_card_input_required(message):
+                logger.info(f"🔄 Redis->WebSocket: 礼品卡输入请求 {message}")
+                self.socketio.emit('gift_card_input_required', message)
+
+            def handle_gift_card_submit_success(message):
+                logger.info(f"🔄 Redis->WebSocket: 礼品卡提交成功 {message}")
+                self.socketio.emit('gift_card_submit_success', message)
+
+            def handle_gift_card_submit_error(message):
+                logger.info(f"🔄 Redis->WebSocket: 礼品卡提交错误 {message}")
+                self.socketio.emit('gift_card_submit_error', message)
+
+            # 注册Redis监听器
+            message_service.subscribe('task_status_update', handle_task_status_update)
+            message_service.subscribe('step_update', handle_step_update)
+            message_service.subscribe('task_log', handle_task_log)
+            message_service.subscribe('gift_card_input_required', handle_gift_card_input_required)
+            message_service.subscribe('gift_card_submit_success', handle_gift_card_submit_success)
+            message_service.subscribe('gift_card_submit_error', handle_gift_card_submit_error)
+
+            logger.info("✅ Redis监听器已设置，消息将自动转发到WebSocket客户端")
+
+        except Exception as e:
+            logger.error(f"❌ 设置Redis监听器失败: {e}")

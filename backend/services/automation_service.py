@@ -5,39 +5,320 @@ from typing import Dict, Optional
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from models.task import Task, TaskStatus, TaskStep
 from .ip_service import IPService
+from .message_service import get_message_service
+from .message_service_sota import get_sota_message_service
 
 logger = logging.getLogger(__name__)
 
 class AutomationService:
     """基于apple_automator.py的自动化服务 - 完全重写版本"""
     
-    def __init__(self):
+    def __init__(self, ip_service=None):
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.contexts: Dict[str, BrowserContext] = {}
         self.pages: Dict[str, Page] = {}
         self.websocket_handler = None
-        # 初始化IP切换服务
-        self.ip_service = IPService(rotation_enabled=True)
-        self.ip_service.initialize_proxy_pool()
+        # 🚀 优化：使用传入的IP服务或延迟初始化
+        self.ip_service = ip_service
+        if self.ip_service is None:
+            # 延迟初始化，避免启动时阻塞
+            self.ip_service = IPService(rotation_enabled=True)
+        # 初始化消息服务（兼容旧版本）
+        self.message_service = get_message_service()
+        # 🚀 初始化SOTA消息服务
+        self.sota_message_service = get_sota_message_service()
         
     def set_websocket_handler(self, handler):
         """设置WebSocket处理器用于实时反馈"""
         self.websocket_handler = handler
     
     def _send_step_update(self, task: Task, step: str, status: str, progress: float = None, message: str = ""):
-        """发送步骤更新到前端"""
-        if self.websocket_handler:
-            if progress is None:
-                progress = task.progress
-            self.websocket_handler.send_step_update(task.id, step, status, progress, message)
+        """发送步骤更新到前端 - 确保任务状态正确更新 - 高频率同步版本"""
+        try:
+            # 🚀 根据step更新任务的实际状态
+            if step == TaskStep.STAGE_1_PRODUCT_CONFIG.value:
+                task.status = TaskStatus.STAGE_1_PRODUCT_CONFIG
+            elif step == TaskStep.STAGE_2_ACCOUNT_LOGIN.value:
+                task.status = TaskStatus.STAGE_2_ACCOUNT_LOGIN
+            elif step == TaskStep.STAGE_3_ADDRESS_PHONE.value:
+                task.status = TaskStatus.STAGE_3_ADDRESS_PHONE
+            elif step == TaskStep.STAGE_4_GIFT_CARD.value:
+                if status == "paused" or "等待" in message:
+                    task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+                else:
+                    task.status = TaskStatus.STAGE_4_GIFT_CARD
+
+            # 更新任务步骤和进度
+            task.current_step = step
+            if progress is not None:
+                task.progress = progress
+
+            # 🚀 立即多重同步 - 确保快速响应
+            import asyncio
+            import time
+            
+            # 1. SOTA实时同步服务（最高优先级）
+            try:
+                from services.realtime_sync_service import get_realtime_sync_service
+                realtime_service = get_realtime_sync_service()
+                if realtime_service:
+                    realtime_service.publish_step_update(
+                        task_id=task.id,
+                        step=step,
+                        status=status,
+                        progress=progress or task.progress,
+                        message=message
+                    )
+                    realtime_service.publish_task_status(
+                        task_id=task.id,
+                        status=task.status.value,
+                        progress=task.progress,
+                        message=message
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ SOTA同步失败: {e}")
+            
+            # 2. 立即WebSocket广播
+            if self.websocket_handler:
+                self.websocket_handler.broadcast('task_update', task.to_dict())
+                if progress is None:
+                    progress = task.progress
+                self.websocket_handler.send_step_update(task.id, step, status, progress, message)
+            
+            # 3. 立即Redis同步
+            if hasattr(self, 'message_service') and self.message_service:
+                status_value = task.status.value if hasattr(task.status, 'value') else str(task.status)
+                self.message_service.sync_task_status(
+                    task_id=task.id,
+                    status=status_value,
+                    progress=task.progress,
+                    message=f"{step}: {message}" if message else step
+                )
+
+                # 发送步骤更新事件
+                self.message_service.publish('step_update', {
+                    'task_id': task.id,
+                    'step': step,
+                    'status': status,
+                    'progress': progress or task.progress,
+                    'message': message,
+                    'timestamp': time.time()
+                })
+
+            # 4. SOTA消息服务
+            if hasattr(self, 'sota_message_service') and self.sota_message_service:
+                self.sota_message_service.send_step_update(
+                    task_id=task.id,
+                    step=step,
+                    status=status,
+                    progress=progress,
+                    message=message
+                )
+
+            logger.info(f"✅ SOTA高频率步骤更新已同步: {task.id} - {step} ({status}) - 任务状态: {task.status}")
+
+        except Exception as e:
+            logger.error(f"❌ 发送步骤更新失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _send_log(self, task: Task, level: str, message: str):
-        """发送日志到前端"""
-        task.add_log(message, level)
-        if self.websocket_handler:
-            self.websocket_handler.send_task_log(task.id, level, message)
-        
+        """发送日志到前端 - SOTA版本"""
+        try:
+            # 添加到任务日志
+            task.add_log(message, level)
+
+            # 🚀 使用SOTA消息服务
+            self.sota_message_service.sync_task_log(task.id, level, message)
+
+            # 兼容旧版本
+            self.message_service.sync_task_log(task.id, level, message)
+
+            logger.info(f"✅ 日志已同步: {task.id} - [{level}] {message}")
+
+            # 保持向后兼容
+            if self.websocket_handler:
+                self.websocket_handler.send_task_log(task.id, level, message)
+
+        except Exception as e:
+            logger.error(f"❌ 发送日志失败: {e}")
+
+    async def execute_task(self, task: Task) -> bool:
+        """🚀 执行四阶段任务流程 - 主入口方法"""
+        try:
+            self._send_log(task, "info", f"🚀 开始执行任务: {task.config.name}")
+
+            # 初始化浏览器
+            if not await self.initialize(task):
+                return False
+
+            # 🎯 阶段1：产品配置
+            if not await self._execute_stage_1_product_config(task):
+                return False
+
+            # 🎯 阶段2：账号登录
+            if not await self._execute_stage_2_account_login(task):
+                return False
+
+            # 🎯 阶段3：地址电话配置
+            if not await self._execute_stage_3_address_phone(task):
+                return False
+
+            # 🎯 阶段4：礼品卡配置 - 这里会暂停等待用户输入
+            if not await self._execute_stage_4_gift_card(task):
+                return False
+
+            self._send_log(task, "success", "✅ 任务执行完成")
+            return True
+
+        except Exception as e:
+            self._send_log(task, "error", f"❌ 任务执行失败: {str(e)}")
+            logger.error(f"任务执行失败: {str(e)}")
+            return False
+        finally:
+            # 注意：不要在这里清理资源，因为用户可能还需要在浏览器中操作
+            pass
+
+    # 🚀 四阶段执行方法
+    async def _execute_stage_1_product_config(self, task: Task) -> bool:
+        """阶段1：产品配置"""
+        try:
+            # 🚀 更新任务状态为阶段1
+            task.status = TaskStatus.STAGE_1_PRODUCT_CONFIG
+            self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "started", 25, "开始产品配置阶段")
+
+            # 导航到产品页面
+            if not await self.navigate_to_product(task):
+                task.status = TaskStatus.FAILED
+                self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "导航到产品页面失败")
+                return False
+
+            # 配置产品选项
+            if not await self.configure_product(task):
+                task.status = TaskStatus.FAILED
+                self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "产品配置失败")
+                return False
+
+            # 添加到购物车
+            if not await self.add_to_bag(task):
+                task.status = TaskStatus.FAILED
+                self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "添加到购物车失败")
+                return False
+
+            self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "completed", 25, "✅ 产品配置阶段完成")
+            self._send_log(task, "success", "🎉 阶段1：产品配置 - 成功完成")
+            return True
+
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, f"产品配置阶段失败: {str(e)}")
+            self._send_log(task, "error", f"❌ 阶段1失败: {str(e)}")
+            return False
+
+    async def _execute_stage_2_account_login(self, task: Task) -> bool:
+        """阶段2：账号登录 - 现在登录已在阶段1的checkout中处理"""
+        try:
+            # 🚀 更新任务状态为阶段2
+            task.status = TaskStatus.STAGE_2_ACCOUNT_LOGIN
+            self._send_step_update(task, TaskStep.STAGE_2_ACCOUNT_LOGIN.value, "started", 50, "开始账号登录阶段")
+
+            # 获取页面对象
+            page = self.pages.get(task.id)
+            if not page:
+                raise Exception("浏览器页面不可用")
+
+            # 检查当前页面状态，确认登录是否已完成
+            current_url = page.url
+            page_title = await page.title()
+            task.add_log(f"阶段2检查 - 当前URL: {current_url}", "info")
+            task.add_log(f"阶段2检查 - 页面标题: {page_title}", "info")
+
+            # 检测页面状态
+            page_state = await self._detect_page_state(page)
+            task.add_log(f"阶段2检查 - 页面状态: {page_state}", "info")
+
+            if page_state == "checkout_page" or "checkout" in current_url.lower() or "billing" in current_url.lower():
+                task.add_log("✅ 登录已完成，当前在结账页面", "success")
+            elif page_state == "already_logged_in":
+                task.add_log("✅ 检测到已登录状态", "success")
+            else:
+                # 如果还没有登录，尝试登录
+                task.add_log("⚠️ 登录可能未完成，尝试处理登录", "warning")
+                await self._handle_apple_login(page, task)
+
+            self._send_step_update(task, TaskStep.STAGE_2_ACCOUNT_LOGIN.value, "completed", 50, "✅ 账号登录阶段完成")
+            self._send_log(task, "success", "🎉 阶段2：账号登录 - 成功完成")
+            return True
+
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            self._send_step_update(task, TaskStep.STAGE_2_ACCOUNT_LOGIN.value, "failed", 50, f"账号登录阶段失败: {str(e)}")
+            self._send_log(task, "error", f"❌ 阶段2失败: {str(e)}")
+            return False
+
+    async def _execute_stage_3_address_phone(self, task: Task) -> bool:
+        """阶段3：地址电话配置"""
+        try:
+            # 🚀 更新任务状态为阶段3
+            task.status = TaskStatus.STAGE_3_ADDRESS_PHONE
+            self._send_step_update(task, TaskStep.STAGE_3_ADDRESS_PHONE.value, "started", 75, "开始地址电话配置阶段")
+
+            # 获取页面对象
+            page = self.pages.get(task.id)
+            if not page:
+                raise Exception("浏览器页面不可用")
+
+            # 获取账号配置中的电话号码
+            account_config = task.config.account_config
+            phone_number = account_config.phone_number if account_config else '07700900000'
+
+            # 继续结账流程（包括地址和电话号码配置）
+            await self._continue_checkout_flow(page, task, phone_number)
+
+            self._send_step_update(task, TaskStep.STAGE_3_ADDRESS_PHONE.value, "completed", 75, "✅ 地址电话配置阶段完成")
+            self._send_log(task, "success", "🎉 阶段3：地址电话配置 - 成功完成")
+            return True
+
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            self._send_step_update(task, TaskStep.STAGE_3_ADDRESS_PHONE.value, "failed", 75, f"地址电话配置阶段失败: {str(e)}")
+            self._send_log(task, "error", f"❌ 阶段3失败: {str(e)}")
+            return False
+
+    async def _execute_stage_4_gift_card(self, task: Task) -> bool:
+        """阶段4：礼品卡配置"""
+        try:
+            # 🚀 更新任务状态为阶段4
+            task.status = TaskStatus.STAGE_4_GIFT_CARD
+            self._send_step_update(task, TaskStep.STAGE_4_GIFT_CARD.value, "started", 100, "开始礼品卡配置阶段")
+
+            # 获取页面对象
+            page = self.pages.get(task.id)
+            if not page:
+                raise Exception("浏览器页面不可用")
+
+            # 检查是否已经有礼品卡信息（用户已经输入过）
+            if task.config.gift_cards or task.config.gift_card_code:
+                task.add_log("🎁 检测到已有礼品卡信息，直接应用礼品卡", "info")
+                # 直接应用礼品卡，不再等待用户输入
+                await self._apply_existing_gift_cards(page, task)
+            else:
+                task.add_log("🎁 没有礼品卡信息，等待用户输入", "info")
+                # 处理礼品卡输入（这里会暂停等待用户输入）
+                await self._handle_gift_card_input(page, task)
+
+            # 如果到达这里，说明礼品卡处理完成
+            self._send_step_update(task, TaskStep.STAGE_4_GIFT_CARD.value, "completed", 100, "✅ 礼品卡配置阶段完成")
+            self._send_log(task, "success", "🎉 阶段4：礼品卡配置 - 成功完成")
+            return True
+
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            self._send_step_update(task, TaskStep.STAGE_4_GIFT_CARD.value, "failed", 100, f"礼品卡配置阶段失败: {str(e)}")
+            self._send_log(task, "error", f"❌ 阶段4失败: {str(e)}")
+            return False
+
     async def initialize(self, task: Task) -> bool:
         """初始化Playwright"""
         try:
@@ -153,6 +434,11 @@ class AutomationService:
 
                     await self._find_and_click_add_to_bag(page, task)
                     task.add_log("✅ 商品已成功添加到购物袋", "success")
+
+                    # 🚀 关键修复：添加到购物袋后，立即进入结账流程
+                    task.add_log("🛒 开始进入结账流程...", "info")
+                    await self.checkout(task)
+
                     return True
 
                 except Exception as e:
@@ -201,8 +487,8 @@ class AutomationService:
 
                 element = page.locator(selector).first
 
-                # 等待元素可见
-                await element.wait_for(state='visible', timeout=10000)
+                # 等待元素可见 - 🚀 增加超时时间
+                await element.wait_for(state='visible', timeout=20000)
 
                 # 滚动到元素位置
                 await element.scroll_into_view_if_needed()
@@ -328,11 +614,11 @@ class AutomationService:
                 task.add_log("尝试备用Review Bag策略...", "info")
                 await self._try_fallback_review_bag(page, task)
 
-            # 等待进入购物袋页面
+            # 等待进入购物袋页面 - 🚀 增加超时时间应对网络延迟
             try:
                 await page.wait_for_function(
                     "document.title.includes('Bag') || document.title.includes('Cart') || window.location.href.includes('bag') || window.location.href.includes('cart')",
-                    timeout=20000
+                    timeout=30000  # 增加到30秒
                 )
                 task.add_log(f"✅ 已成功进入购物袋页面，标题: {await page.title()}", "success")
 
@@ -558,6 +844,11 @@ class AutomationService:
             task.add_log("✅ 已在结账页面，继续后续流程", "success")
             await self._continue_checkout_flow(page, task, phone_number)
             return
+        elif page_state == "product_config_page":
+            task.add_log("⚠️ 检测到产品配置页面，但这里应该是登录处理阶段", "warning")
+            task.add_log("这可能表示前面的checkout流程没有正确执行", "warning")
+            # 不在这里处理产品配置页面，让调用方处理
+            raise Exception("在登录阶段检测到产品配置页面，流程异常")
 
         # 增强的重试机制：最多尝试5次，针对高并发场景优化
         max_retries = 5
@@ -565,12 +856,39 @@ class AutomationService:
             try:
                 task.add_log(f"登录尝试 {attempt + 1}/{max_retries}", "info")
 
-                # 检查是否有安全验证错误
-                await self._check_and_handle_security_errors(page, task)
+                login_attempt_result = await self._attempt_smart_login(page, task, email, password, phone_number)
 
-                await self._attempt_smart_login(page, task, email, password, phone_number)
-                task.add_log("✅ 登录成功", "success")
-                return
+                # 登录尝试完成后，等待页面稳定并检测状态
+                await page.wait_for_timeout(5000)  # 增加等待时间，确保页面完全加载
+                current_url = page.url
+                page_title = await page.title()
+
+                task.add_log(f"登录尝试后当前URL: {current_url}", "info")
+                task.add_log(f"登录尝试后页面标题: {page_title}", "info")
+
+                # 更宽松的登录成功检测 - 优先检查URL
+                login_success_indicators = [
+                    'checkout', 'fulfillment', 'billing', 'payment', 'shipping',
+                    'secure8.store.apple.com', 'store.apple.com/uk/shop/checkout'
+                ]
+
+                # 检查URL是否包含登录成功的指示器
+                url_indicates_success = any(indicator in current_url.lower() for indicator in login_success_indicators)
+
+                # 检查页面标题是否包含结账相关信息
+                title_indicates_success = any(indicator in page_title.lower() for indicator in ['checkout', 'bag', 'cart', 'billing', 'payment'])
+
+                # 如果URL或标题表明已经在结账流程中，认为登录成功
+                if url_indicates_success or title_indicates_success:
+                    task.add_log("✅ 登录成功，已进入结账流程", "success")
+                    return
+                elif login_attempt_result:
+                    # 如果登录方法返回成功，但URL不明确，也认为成功
+                    task.add_log("✅ 登录方法执行成功", "success")
+                    return
+                else:
+                    # 只有在明确失败的情况下才抛出异常
+                    raise Exception(f"登录失败，当前页面: {current_url}")
 
             except Exception as e:
                 error_msg = str(e)
@@ -606,73 +924,23 @@ class AutomationService:
         """SOTA方法：等待页面完全稳定 - 基于apple_automator.py"""
         task.add_log("⏳ 等待页面稳定...", "info")
 
-        # 等待网络空闲
+        # 等待网络空闲 - 🚀 增加超时时间应对网络延迟
         try:
-            await page.wait_for_load_state('networkidle', timeout=10000)
+            await page.wait_for_load_state('networkidle', timeout=20000)
         except:
-            await page.wait_for_load_state('domcontentloaded', timeout=10000)
+            await page.wait_for_load_state('domcontentloaded', timeout=20000)
 
         # 等待JavaScript执行完成
         await page.wait_for_function(
             "document.readyState === 'complete'",
-            timeout=10000
+            timeout=20000
         )
 
         # 额外等待确保动态内容加载
         await page.wait_for_timeout(2000)
         task.add_log("✅ 页面已稳定", "success")
 
-    async def _check_and_handle_security_errors(self, page: Page, task: Task):
-        """检查并处理安全验证错误"""
-        try:
-            # 检查常见的安全错误信息
-            security_error_selectors = [
-                'text*="无法识别你的身份"',
-                'text*="We can\'t verify your identity"',
-                'text*="验证失败"',
-                'text*="Verification failed"',
-                'text*="请稍后再试"',
-                'text*="Please try again later"',
-                'text*="Too many attempts"',
-                'text*="账户暂时锁定"',
-                'text*="Account temporarily locked"'
-            ]
 
-            for selector in security_error_selectors:
-                try:
-                    error_element = page.locator(selector).first
-                    if await error_element.count() > 0 and await error_element.is_visible():
-                        error_text = await error_element.text_content()
-                        task.add_log(f"🚨 检测到安全验证错误: {error_text}", "warning")
-
-                        # 尝试关闭错误对话框
-                        close_selectors = [
-                            'button:has-text("确定")',
-                            'button:has-text("OK")',
-                            'button:has-text("关闭")',
-                            'button:has-text("Close")',
-                            '[aria-label="Close"]',
-                            '.close-button'
-                        ]
-
-                        for close_selector in close_selectors:
-                            try:
-                                close_btn = page.locator(close_selector).first
-                                if await close_btn.count() > 0 and await close_btn.is_visible():
-                                    await close_btn.click()
-                                    task.add_log("✅ 已关闭安全错误对话框", "info")
-                                    break
-                            except:
-                                continue
-
-                        return True
-                except:
-                    continue
-
-            return False
-        except Exception as e:
-            task.add_log(f"检查安全错误时出现异常: {e}", "warning")
-            return False
 
     async def _is_security_related_error(self, page: Page, error_msg: str) -> bool:
         """判断是否是安全相关错误"""
@@ -695,8 +963,7 @@ class AutomationService:
             if keyword.lower() in error_msg_lower:
                 return True
 
-        # 同时检查页面上是否有安全错误提示
-        return await self._check_and_handle_security_errors(page, None)
+        return False
 
     async def _attempt_smart_login(self, page: Page, task: Task, email: str, password: str, phone_number: str):
         """智能登录尝试，支持多种登录方式 - 基于apple_automator.py"""
@@ -704,26 +971,27 @@ class AutomationService:
         # 方法1: 检查iframe登录
         iframe_result = await self._try_iframe_login(page, task, email, password)
         if iframe_result:
-            # 登录成功后，继续结账流程并填写电话号码
-            await self._continue_checkout_flow(page, task, phone_number)
-            return
+            task.add_log("✅ iframe登录方法执行完成", "success")
+            return True
 
         # 方法2: 检查直接登录表单
         direct_result = await self._try_direct_login(page, task, email, password)
         if direct_result:
-            # 登录成功后，继续结账流程并填写电话号码
-            await self._continue_checkout_flow(page, task, phone_number)
-            return
+            task.add_log("✅ 直接登录方法执行完成", "success")
+            return True
 
         # 方法3: 检查是否需要点击登录链接
         signin_link_result = await self._try_signin_link(page, task)
         if signin_link_result:
-            # 点击登录链接后重新尝试
+            task.add_log("✅ 找到并点击了登录链接", "success")
+            # 点击登录链接后等待页面加载，然后重新尝试登录
             await page.wait_for_timeout(3000)
-            await self._attempt_smart_login(page, task, email, password, phone_number)
-            return
+            # 递归调用，但不返回结果，让上层重新检测
+            return False
 
-        raise Exception("所有登录方法都失败了")
+        # 如果所有方法都失败，返回False让上层处理
+        task.add_log("⚠️ 所有登录方法都未找到可用的登录表单", "warning")
+        return False
 
     async def _continue_checkout_flow(self, page: Page, task: Task, phone_number: str):
         """继续结账流程 - 基于apple_automator.py"""
@@ -739,35 +1007,279 @@ class AutomationService:
         await self._handle_address_confirmation_and_continue(page, task)
 
     async def _detect_page_state(self, page: Page) -> str:
-        """检测页面状态 - 基于apple_automator.py"""
+        """检测页面状态 - 修复版，避免误判产品配置页面"""
         current_url = page.url
         page_title = await page.title()
 
-        # 检查是否已登录
-        if any(indicator in current_url for indicator in ['checkout', 'billing', 'payment']):
-            if 'signin' not in current_url and 'login' not in current_url:
-                return "checkout_page"
+        # 🔍 首先检查是否在产品配置页面 - 但只在特定上下文中返回
+        product_config_indicators = [
+            'step=attach',
+            'step=config',
+            'step=select',
+            'buy-iphone',
+            'buy-ipad',
+            'buy-mac',
+            'purchaseOption=fullPrice'
+        ]
 
-        # 检查是否在登录页面
-        if any(indicator in current_url for indicator in ['signin', 'login', 'auth']):
+        # 检查是否在产品配置页面，但不在登录检测中返回这个状态
+        # 因为产品配置页面应该通过checkout流程处理，而不是登录流程
+        is_product_config = any(indicator in current_url.lower() for indicator in product_config_indicators)
+        if is_product_config and 'apple.com' in current_url and ('shop' in current_url or 'buy' in current_url):
+            # 在产品配置页面时，检查是否有登录相关的元素
+            # 如果没有，则返回unknown，让调用方决定如何处理
+            pass  # 继续检查其他状态
+
+        # 增强的结账页面检测 - 特别针对 secure8.store.apple.com 域名
+        checkout_indicators = [
+            'checkout',
+            'billing',
+            'payment',
+            'fulfillment',  # 新增：针对 Fulfillment-init 等
+            'shipping'
+        ]
+
+        # 检查是否已登录并在结账流程中
+        if any(indicator in current_url.lower() for indicator in checkout_indicators):
+            # 排除仍在登录页面的情况
+            if 'signin' not in current_url.lower() and 'login' not in current_url.lower():
+                # 特别检查 secure8.store.apple.com 域名
+                if 'secure8.store.apple.com' in current_url or 'store.apple.com' in current_url:
+                    return "checkout_page"
+                # 其他Apple域名的结账页面
+                elif 'apple.com' in current_url:
+                    return "checkout_page"
+
+        # 检查是否在登录页面 - 更严格的检测
+        login_indicators = ['signin', 'login', 'auth', 'appleid']
+        if any(indicator in current_url.lower() for indicator in login_indicators):
             return "login_page"
 
-        # 检查页面内容
+        # 检查页面内容 - 更精确的检测
         try:
-            # 检查是否有登录表单
-            login_forms = await page.locator('form, iframe, [data-testid*="login"], [data-testid*="signin"]').count()
-            if login_forms > 0:
-                return "login_page"
+            # 只有在明确的登录页面才检测登录表单
+            if 'appleid' in current_url.lower() or 'idmsa' in current_url.lower():
+                login_forms = await page.locator('iframe[src*="idmsa.apple.com"], iframe[src*="appleid.apple.com"]').count()
+                if login_forms > 0:
+                    return "login_page"
 
             # 检查是否有结账相关元素
-            checkout_elements = await page.locator('[data-testid*="checkout"], [data-testid*="billing"], .checkout, .billing').count()
+            checkout_elements = await page.locator('[data-testid*="checkout"], [data-testid*="billing"], .checkout, .billing, [data-testid*="fulfillment"]').count()
             if checkout_elements > 0:
                 return "checkout_page"
 
         except Exception as e:
             logger.debug(f"页面状态检测异常: {e}")
 
+        # 如果是产品配置页面，返回unknown让调用方处理
+        if is_product_config:
+            return "unknown"
+
         return "unknown"
+
+
+
+    async def _check_account_locked(self, page: Page, task: Task) -> bool:
+        """检查账号是否被锁定（仅用于记录状态，不阻止登录流程）"""
+        try:
+            current_url = page.url
+            page_title = await page.title()
+
+            task.add_log(f"🔍 检查账号状态 - URL: {current_url}", "info")
+            task.add_log(f"🔍 检查账号状态 - 标题: {page_title}", "info")
+
+            # 等待页面稳定
+            await page.wait_for_timeout(3000)
+
+            # 检查页面内容中是否包含账号锁定的关键信息
+            page_content = await page.content()
+
+            # 检查多种可能的账号锁定提示
+            lock_indicators = [
+                "This Apple Account has been locked for security reasons",
+                "You must unlock your account before signing in",
+                "account has been locked",
+                "account is locked",
+                "security reasons",
+                "unlock your account",
+                "locked for security",
+                "account locked",
+                "temporarily locked",
+                "suspended",
+                "disabled"
+            ]
+
+            account_locked = False
+            lock_message = ""
+
+            # 记录页面内容的一部分用于调试
+            content_preview = page_content[:1000] if len(page_content) > 1000 else page_content
+            task.add_log(f"🔍 页面内容预览: {content_preview}", "debug")
+
+            for indicator in lock_indicators:
+                if indicator.lower() in page_content.lower():
+                    account_locked = True
+                    lock_message = indicator
+                    task.add_log(f"🚨 检测到锁定关键词: {indicator}", "warning")
+                    break
+
+            # 也检查页面上是否有相关的错误元素
+            if not account_locked:
+                try:
+                    # 检查常见的错误消息选择器
+                    error_selectors = [
+                        '.error-message',
+                        '.alert-error',
+                        '[role="alert"]',
+                        '.notification-error',
+                        '.security-message',
+                        '.account-locked'
+                    ]
+
+                    for selector in error_selectors:
+                        error_elements = await page.locator(selector).all()
+                        for element in error_elements:
+                            try:
+                                error_text = await element.text_content()
+                                if error_text and any(indicator.lower() in error_text.lower() for indicator in lock_indicators):
+                                    account_locked = True
+                                    lock_message = error_text.strip()
+                                    break
+                            except:
+                                continue
+                        if account_locked:
+                            break
+
+                except Exception as e:
+                    logger.debug(f"检查错误元素失败: {e}")
+
+            if account_locked:
+                logger.warning(f"⚠️ 检测到账号可能被锁定: {lock_message}")
+                await self._handle_account_locked(page, task, lock_message)
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"检查账号锁定状态失败: {e}")
+            return False
+
+    async def _handle_account_locked(self, page: Page, task: Task, lock_message: str):
+        """处理账号锁定问题（仅记录状态，不阻止流程）"""
+        try:
+            current_url = page.url
+            page_title = await page.title()
+
+            # 记录详细信息
+            logger.warning(f"⚠️ 检测到账号可能存在安全问题")
+            logger.warning(f"🔗 当前URL: {current_url}")
+            logger.warning(f"📄 页面标题: {page_title}")
+            logger.warning(f"💬 提示消息: {lock_message}")
+
+            # 添加任务日志
+            task.add_log("⚠️ 检测到账号可能存在安全问题", "warning")
+            task.add_log(f"📄 页面标题: {page_title}", "info")
+            task.add_log(f"🔗 当前URL: {current_url}", "info")
+            task.add_log(f"💬 提示消息: {lock_message}", "info")
+            task.add_log("📝 已记录账号状态，继续执行任务", "info")
+
+            # 标记账号状态为异常
+            if task.config.account_config:
+                account_email = task.config.account_config.email
+                await self._mark_account_as_abnormal(account_email, current_url, f"账号锁定: {lock_message}")
+                task.add_log(f"🔴 账号 {account_email} 已标记为异常状态", "error")
+
+            # 设置任务失败状态
+            task.status = TaskStatus.FAILED
+            task.error_message = f"账号已被锁定: {lock_message}"
+
+            # 发送WebSocket更新到前端
+            self._send_step_update(task, "account_locked", "failed", task.progress,
+                                 f"账号锁定: {lock_message}")
+
+            # 发送特殊的账号锁定事件到前端
+            try:
+                if hasattr(self, 'websocket_handler') and self.websocket_handler:
+                    await self.websocket_handler.emit('account_security_issue', {
+                        'task_id': task.id,
+                        'account_email': task.config.account_config.email if task.config.account_config else None,
+                        'current_url': current_url,
+                        'page_title': page_title,
+                        'lock_message': lock_message,
+                        'timestamp': datetime.now().isoformat()
+                    })
+            except Exception as ws_error:
+                logger.error(f"发送WebSocket事件失败: {ws_error}")
+
+        except Exception as e:
+            logger.error(f"处理账号锁定问题失败: {e}")
+            task.add_log(f"❌ 处理账号锁定问题失败: {e}", "error")
+
+    async def _handle_secure_checkout_issue(self, page: Page, task: Task):
+        """处理Secure Checkout问题页面"""
+        try:
+            current_url = page.url
+            page_title = await page.title()
+
+            # 记录详细信息
+            logger.error(f"🚨 遇到Secure Checkout问题页面")
+            logger.error(f"🔗 当前URL: {current_url}")
+            logger.error(f"📄 页面标题: {page_title}")
+
+            # 添加任务日志
+            task.add_log("🚨 检测到账号安全问题", "error")
+            task.add_log(f"📄 页面标题: {page_title}", "error")
+            task.add_log(f"🔗 当前URL: {current_url}", "error")
+            task.add_log("⚠️ 账号可能需要额外验证或已被标记为异常", "warning")
+
+            # 标记账号状态为异常
+            if task.config.account_config:
+                account_email = task.config.account_config.email
+                await self._mark_account_as_abnormal(account_email, current_url, page_title)
+                task.add_log(f"🔴 账号 {account_email} 已标记为异常状态", "error")
+
+            # 设置任务失败状态
+            task.status = TaskStatus.FAILED
+            task.error_message = f"账号安全验证问题: {page_title}"
+
+            # 发送WebSocket更新到前端
+            self._send_step_update(task, "account_security_issue", "failed", task.progress,
+                                 f"账号安全问题: {page_title}")
+
+            # 发送特殊的账号异常事件到前端
+            try:
+                if hasattr(self, 'websocket_handler') and self.websocket_handler:
+                    await self.websocket_handler.emit('account_security_issue', {
+                        'task_id': task.id,
+                        'account_email': task.config.account_config.email if task.config.account_config else None,
+                        'current_url': current_url,
+                        'page_title': page_title,
+                        'timestamp': datetime.now().isoformat()
+                    })
+            except Exception as ws_error:
+                logger.error(f"发送WebSocket事件失败: {ws_error}")
+
+        except Exception as e:
+            logger.error(f"处理Secure Checkout问题失败: {e}")
+            task.add_log(f"❌ 处理账号安全问题失败: {e}", "error")
+
+    async def _mark_account_as_abnormal(self, email: str, current_url: str, page_title: str):
+        """标记账号为异常状态"""
+        try:
+            from models.database import DatabaseManager
+            db_manager = DatabaseManager()
+
+            # 更新账号状态为异常
+            success = db_manager.update_account_status_by_email(email, "异常",
+                f"Secure Checkout问题: {page_title} | URL: {current_url}")
+
+            if success:
+                logger.info(f"✅ 账号 {email} 状态已更新为异常")
+            else:
+                logger.warning(f"⚠️ 未找到账号 {email} 或更新失败")
+
+        except Exception as e:
+            logger.error(f"标记账号异常状态失败: {e}")
 
     async def _try_iframe_login(self, page: Page, task: Task, email: str, password: str) -> bool:
         """尝试iframe登录 - 基于apple_automator.py"""
@@ -892,10 +1404,8 @@ class AutomationService:
         # 等待登录完成
         await page.wait_for_load_state('domcontentloaded', timeout=15000)
 
-        # 检查是否有安全验证错误
-        await page.wait_for_timeout(2000)  # 等待错误信息显示
-        if await self._check_and_handle_security_errors(page, task):
-            raise Exception("登录过程中遇到安全验证错误")
+        # 等待页面稳定
+        await page.wait_for_timeout(2000)
 
         task.add_log("✅ iframe登录流程完成", "success")
 
@@ -942,10 +1452,8 @@ class AutomationService:
             # 等待登录完成
             await page.wait_for_load_state('domcontentloaded', timeout=15000)
 
-            # 检查是否有安全验证错误
-            await page.wait_for_timeout(2000)  # 等待错误信息显示
-            if await self._check_and_handle_security_errors(page, task):
-                raise Exception("登录过程中遇到安全验证错误")
+            # 等待页面稳定
+            await page.wait_for_timeout(2000)
 
             task.add_log("✅ 直接登录流程完成", "success")
             return True
@@ -1385,26 +1893,57 @@ class AutomationService:
                 await page.screenshot(path=f"payment_verification_error_{task.id}.png")
     
     async def apply_gift_card(self, task: Task) -> bool:
-        """SOTA方法：在结账页面应用多张礼品卡 - 支持Apple的"add another card"功能"""
+        """礼品卡应用流程 - 重定向到阶段4方法"""
+        return await self._execute_stage_4_gift_card(task)
+
+    async def continue_with_gift_cards(self, task: Task, gift_cards: list) -> bool:
+        """用户提交礼品卡后继续执行"""
         try:
             page = self.pages.get(task.id)
             if not page:
                 raise Exception("Page not found for task")
 
-            task.add_log("🎁 多张礼品卡应用流程开始...", "info")
-            self._send_step_update(task, "applying_gift_card", "started", message="开始应用礼品卡...")
+            task.add_log(f"🎁 收到用户提交的 {len(gift_cards)} 张礼品卡，开始应用...", "info")
 
-            # 立即写入任务传递调试信息
-            task_debug_log_path = f"task_transfer_debug_{task.id}.log"
-            with open(task_debug_log_path, 'w', encoding='utf-8') as debug_file:
-                debug_file.write(f"=== 任务传递调试 {datetime.now()} ===\n")
-                debug_file.write(f"任务ID: {task.id}\n")
-                debug_file.write(f"任务类型: {type(task)}\n")
-                debug_file.write(f"任务config类型: {type(task.config)}\n")
-                debug_file.write(f"任务config内容: {vars(task.config)}\n")
-                debug_file.write(f"任务完整内容: {vars(task)}\n\n")
+            # 应用每张礼品卡
+            for i, gift_card in enumerate(gift_cards, 1):
+                gift_card_number = gift_card.get('number', '')
+                expected_status = gift_card.get('status', 'unknown')
 
-            # 获取前端传递的真实礼品卡配置
+                task.add_log(f"🎯 应用第 {i} 张礼品卡: {gift_card_number[:4]}**** (状态: {expected_status})", "info")
+
+                try:
+                    # 点击礼品卡链接
+                    await self._sota_click_gift_card_link(page, task)
+
+                    # 填写礼品卡号码
+                    await self._sota_fill_gift_card_input(page, task, gift_card_number)
+
+                    # 点击Apply按钮
+                    await self._apply_gift_card_and_get_feedback(page, task)
+
+                    task.add_log(f"✅ 第 {i} 张礼品卡应用完成", "success")
+
+                    # 如果还有更多礼品卡，等待页面更新
+                    if i < len(gift_cards):
+                        await page.wait_for_timeout(2000)
+
+                except Exception as e:
+                    task.add_log(f"❌ 第 {i} 张礼品卡应用失败: {e}", "error")
+                    continue
+
+            task.add_log("🎉 所有礼品卡应用完成", "success")
+
+            # 恢复任务状态为运行中
+            task.status = TaskStatus.RUNNING
+
+            return True
+
+        except Exception as e:
+            task.add_log(f"❌ 继续礼品卡应用失败: {e}", "error")
+            return False
+
+            # 获取前端传递的真实礼品卡配置（保留原有代码以防需要）
             gift_card_code = getattr(task.config, 'gift_card_code', None)
             gift_cards = getattr(task.config, 'gift_cards', None)
 
@@ -3062,7 +3601,117 @@ class AutomationService:
         except Exception as e:
             task.add_log(f"❌ 购买准备检查失败: {str(e)}", "error")
             return False
-    
+
+    async def _apply_existing_gift_cards(self, page: Page, task: Task):
+        """应用已有的礼品卡信息（用户已经输入过）"""
+        try:
+            task.add_log("🎁 开始应用已有的礼品卡信息", "info")
+
+            # 获取礼品卡信息
+            gift_card_numbers = []
+            if task.config.gift_cards:
+                gift_card_numbers = [gc.number for gc in task.config.gift_cards]
+                task.add_log(f"📋 从gift_cards获取到 {len(gift_card_numbers)} 张礼品卡", "info")
+            elif task.config.gift_card_code:  # 向后兼容
+                gift_card_numbers = [task.config.gift_card_code]
+                task.add_log(f"📋 从gift_card_code获取到礼品卡: {task.config.gift_card_code[:4]}****", "info")
+
+            if not gift_card_numbers:
+                raise Exception("没有找到礼品卡信息")
+
+            # 应用每张礼品卡
+            for i, gift_card_number in enumerate(gift_card_numbers, 1):
+                task.add_log(f"🎯 应用第 {i} 张礼品卡: {gift_card_number[:4]}****", "info")
+
+                try:
+                    # 对于第一张礼品卡，需要点击链接打开输入框
+                    if i == 1:
+                        task.add_log("🔗 点击'Enter your gift card number'链接...", "info")
+                        await self._sota_click_gift_card_link(page, task)
+
+                    # 填写礼品卡号码
+                    task.add_log(f"📝 填写第 {i} 张礼品卡号码...", "info")
+                    await self._sota_fill_gift_card_input(page, task, gift_card_number)
+
+                    # 点击Apply按钮
+                    task.add_log(f"✅ 点击Apply按钮应用第 {i} 张礼品卡...", "info")
+                    await self._apply_gift_card_and_get_feedback(page, task, gift_card_number)
+
+                    task.add_log(f"🎉 第 {i} 张礼品卡应用完成", "success")
+
+                    # 如果还有更多礼品卡，等待页面更新并准备下一张
+                    if i < len(gift_card_numbers):
+                        await page.wait_for_timeout(2000)
+                        task.add_log(f"🔄 准备添加下一张礼品卡 ({i + 1}/{len(gift_card_numbers)})", "info")
+                        await self._click_add_another_card(page, task)
+
+                except Exception as e:
+                    task.add_log(f"❌ 第 {i} 张礼品卡应用失败: {e}", "error")
+                    # 继续处理下一张礼品卡
+                    continue
+
+            task.add_log("✅ 所有礼品卡应用完成", "success")
+
+        except Exception as e:
+            task.add_log(f"❌ 应用已有礼品卡失败: {str(e)}", "error")
+            raise
+
+    async def _handle_gift_card_input(self, page: Page, task: Task):
+        """处理礼品卡输入 - 等待用户通过前端输入礼品卡信息"""
+        import time
+        import asyncio
+
+        try:
+            task.add_log("🎁 到达礼品卡输入阶段，等待用户输入...", "info")
+
+            # 更新任务状态为等待礼品卡输入
+            task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+            self._send_step_update(task, "waiting_gift_card_input", "waiting", 80, "等待用户输入礼品卡信息")
+
+            # 发送礼品卡输入请求到前端
+            if hasattr(self, 'message_service') and self.message_service:
+                self.message_service.publish('gift_card_input_required', {
+                    'task_id': task.id,
+                    'message': '请输入礼品卡信息',
+                    'timestamp': time.time()
+                })
+                task.add_log("✅ 已发送礼品卡输入请求到前端", "info")
+
+            # 等待用户输入（通过检查任务状态变化）
+            task.add_log("⏳ 等待用户通过前端输入礼品卡信息...", "info")
+
+            # 轮询等待用户输入（最多等待10分钟）
+            max_wait_time = 600  # 10分钟
+            check_interval = 2   # 每2秒检查一次
+            waited_time = 0
+
+            while waited_time < max_wait_time:
+                await asyncio.sleep(check_interval)
+                waited_time += check_interval
+
+                # 重新获取任务状态（可能被其他地方更新）
+                current_task = self.task_manager.get_task(task.id) if hasattr(self, 'task_manager') else task
+
+                # 如果状态不再是等待输入，说明用户已经提交了
+                if current_task and current_task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
+                    task.add_log("✅ 检测到用户已提交礼品卡信息，继续执行", "success")
+                    # 更新本地任务对象的状态和配置
+                    task.status = current_task.status
+                    task.config = current_task.config
+                    return
+
+                # 每30秒提醒一次
+                if waited_time % 30 == 0:
+                    task.add_log(f"⏳ 仍在等待用户输入礼品卡信息... (已等待 {waited_time//60} 分钟)", "info")
+
+            # 超时处理
+            task.add_log("⚠️ 等待用户输入超时（10分钟），任务暂停", "warning")
+            raise Exception("等待用户输入礼品卡信息超时")
+
+        except Exception as e:
+            task.add_log(f"❌ 礼品卡输入处理失败: {str(e)}", "error")
+            raise
+
     async def cleanup_task(self, task_id: str, force_close: bool = False):
         """清理任务资源 - 可选择是否强制关闭浏览器"""
         if not force_close:
@@ -3844,76 +4493,73 @@ class AutomationService:
     async def _detect_and_update_gift_card_errors(self, page: Page, task: Task, gift_card_number: str = None):
         """检测礼品卡错误并更新状态到数据库"""
         try:
+            task.add_log("🔍 检测礼品卡应用结果...", "info")
+
+            # 等待页面加载完成
+            await page.wait_for_timeout(3000)
+
             # 获取页面文本内容
             page_content = await page.content()
-            
-            # 定义错误消息和对应状态
+
+            # 定义错误消息和对应状态（修正状态映射）
             error_patterns = {
-                "You have entered an invalid gift card": {
-                    "status": "非本国卡",
-                    "message": "无效礼品卡 - 请检查卡号"
-                },
                 "Please use an Apple Gift Card that has been purchased in United Kingdom": {
-                    "status": "非本国卡", 
-                    "message": "非英国购买的礼品卡"
+                    "status": "非本国卡",
+                    "message": "非英国购买的礼品卡",
+                    "log_level": "error"
+                },
+                "You have entered an invalid gift card. Please check the card number and pin and try again": {
+                    "status": "被充值",
+                    "message": "礼品卡已被使用或无效",
+                    "log_level": "error"
                 },
                 "This gift card has a zero balance": {
                     "status": "0余额",
-                    "message": "礼品卡余额为零"
+                    "message": "礼品卡余额为零",
+                    "log_level": "warning"
                 }
             }
-            
+
             detected_error = None
             error_info = None
-            
+
             # 检测错误模式
             for error_pattern, info in error_patterns.items():
                 if error_pattern in page_content:
                     detected_error = error_pattern
                     error_info = info
-                    task.add_log(f"🚨 检测到礼品卡错误: {error_pattern}", "error")
+                    task.add_log(f"🚨 检测到礼品卡错误: {error_pattern}", info["log_level"])
                     break
-            
+
+            # 如果检测到错误且有礼品卡号码
             if detected_error and gift_card_number:
+                task.add_log(f"📝 更新礼品卡状态: {gift_card_number[:4]}**** -> {error_info['status']}", "warning")
+
                 # 更新数据库中的礼品卡状态
                 await self._update_gift_card_status_in_db(gift_card_number, error_info["status"])
-                
+
                 # 更新任务配置中的礼品卡状态
                 if hasattr(task.config, 'gift_cards') and task.config.gift_cards:
                     for gift_card in task.config.gift_cards:
                         if hasattr(gift_card, 'number') and gift_card.number == gift_card_number:
                             gift_card.error_message = error_info["message"]
                             gift_card.expected_status = error_info["status"]
-                            task.add_log(f"📝 已更新礼品卡状态: {gift_card_number[:4]}**** -> {error_info['status']}", "warning")
                             break
-                
-                # 发送WebSocket更新给前端 - 通过进程通信方式
-                if gift_card_number:
-                    # 通过print输出JSON事件，让task_manager转发给WebSocket
-                    import json
-                    websocket_event = {
-                        'type': 'websocket_event',
-                        'event': 'gift_card_error',
-                        'data': {
-                            'task_id': task.id,
-                            'gift_card_number': gift_card_number[:4] + '****',
-                            'error_status': error_info["status"],
-                            'error_message': error_info["message"]
-                        }
-                    }
-                    print(f"WEBSOCKET_EVENT:{json.dumps(websocket_event)}")
-                    import sys
-                    sys.stdout.flush()
-                
-                # 抛出异常让上层处理
+
+                # 发送WebSocket通知前端更新礼品卡状态
+                await self._notify_gift_card_status_update(gift_card_number, error_info["status"], error_info["message"])
+
+                # 抛出异常以停止当前礼品卡的处理
                 raise Exception(f"礼品卡错误: {error_info['message']}")
-            
-            elif not detected_error:
+
+            # 如果没有检测到错误，说明礼品卡应用成功
+            if not detected_error:
                 task.add_log("✅ 礼品卡应用成功，未检测到错误", "success")
-                
+
                 # 如果成功，更新为有额度状态
                 if gift_card_number:
                     await self._update_gift_card_status_in_db(gift_card_number, "有额度")
+                    await self._notify_gift_card_status_update(gift_card_number, "有额度", "礼品卡应用成功")
                     
         except Exception as e:
             task.add_log(f"⚠️ 礼品卡错误检测过程中出现异常: {e}", "warning")
@@ -3948,45 +4594,32 @@ class AutomationService:
         except Exception as e:
             print(f"❌ 数据库更新失败: {e}")
 
-    # ==================== 余额不足错误检测方法 ====================
-    
-    def _is_insufficient_balance_error(self, error_text: str) -> bool:
-        """检测是否为余额不足错误"""
-        insufficient_balance_patterns = [
-            "Please enter another form of payment to cover the remaining balance",
-            "insufficient funds",
-            "insufficient balance", 
-            "remaining balance",
-            "not enough balance",
-            "payment required"
-        ]
-        
-        error_text_lower = error_text.lower()
-        return any(pattern.lower() in error_text_lower for pattern in insufficient_balance_patterns)
-    
-    def _send_balance_error_event(self, task: Task, error_text: str):
-        """发送余额不足错误事件到前端"""
-        import json
-        import re
-        
-        # 提取金额信息
-        amount_match = re.search(r'£(\d+(?:\.\d{2})?)', error_text)
-        remaining_amount = amount_match.group() if amount_match else "未知金额"
-        
-        websocket_event = {
-            'type': 'websocket_event',
-            'event': 'payment_balance_error',
-            'data': {
-                'task_id': task.id,
-                'error_type': 'insufficient_balance',
-                'error_message': f"礼品卡余额不足，仍需支付 {remaining_amount}",
-                'remaining_amount': remaining_amount,
-                'full_error': error_text
-            }
-        }
-        
-        print(f"WEBSOCKET_EVENT:{json.dumps(websocket_event)}")
-        import sys
-        sys.stdout.flush()
-        
-        task.add_log(f"💳 余额不足: 仍需支付 {remaining_amount}", "error")
+    async def _notify_gift_card_status_update(self, gift_card_number: str, new_status: str, message: str):
+        """通知前端礼品卡状态更新"""
+        import time
+
+        try:
+            # 发送WebSocket消息通知前端
+            if hasattr(self, 'message_service') and self.message_service:
+                self.message_service.publish('gift_card_status_update', {
+                    'gift_card_number': gift_card_number,
+                    'status': new_status,
+                    'message': message,
+                    'timestamp': time.time()
+                })
+                print(f"📡 已发送礼品卡状态更新通知: {gift_card_number[:4]}**** -> {new_status}")
+
+            # 如果有WebSocket处理器，也发送更新
+            from app import websocket_handler
+            if websocket_handler:
+                websocket_handler.broadcast('gift_card_status_update', {
+                    'gift_card_number': gift_card_number,
+                    'status': new_status,
+                    'message': message,
+                    'timestamp': time.time()
+                })
+
+        except Exception as e:
+            print(f"❌ 发送礼品卡状态更新通知失败: {e}")
+
+    # =============

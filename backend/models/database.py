@@ -1,8 +1,11 @@
 import sqlite3
 import logging
-from typing import List, Dict, Optional
+import json
+import threading
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 import os
 
 logger = logging.getLogger(__name__)
@@ -82,11 +85,32 @@ class DatabaseManager:
                     )
                 ''')
                 
+                # 🚀 创建任务表
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id TEXT PRIMARY KEY,
+                        config TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        current_step TEXT,
+                        progress REAL DEFAULT 0.0,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        error_message TEXT,
+                        logs TEXT,
+                        celery_task_id TEXT,
+                        last_updated TEXT NOT NULL
+                    )
+                ''')
+
                 # 创建索引
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_gift_cards_number ON gift_cards(gift_card_number)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_gift_cards_status ON gift_cards(status)')
-                
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_last_updated ON tasks(last_updated)')
+
                 conn.commit()
                 logger.info("数据库初始化成功")
                 
@@ -123,7 +147,25 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"创建账号失败: {str(e)}")
             raise
-    
+
+    def add_account(self, email: str, password: str, phone_number: str = "+447700900000", status: str = "可用", notes: str = "") -> int:
+        """添加账号（API兼容方法）"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                # 使用实际的表结构（没有status和notes字段）
+                cursor.execute('''
+                    INSERT INTO accounts (email, password, phone_number, created_at, updated_at, is_active)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                ''', (email, password, phone_number))
+                conn.commit()
+                account_id = cursor.lastrowid
+                logger.info(f"账号添加成功: {email} (ID: {account_id})")
+                return account_id
+        except Exception as e:
+            logger.error(f"添加账号失败: {str(e)}")
+            raise
+
     def get_all_accounts(self, active_only: bool = True) -> List[Account]:
         """获取所有账号"""
         try:
@@ -192,7 +234,45 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"更新账号失败: {str(e)}")
             return False
-    
+
+    def update_account_status_by_email(self, email: str, status: str, notes: str = None) -> bool:
+        """根据邮箱更新账号状态"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # 构建更新语句
+                update_fields = ['status = ?']
+                params = [status]
+
+                if notes is not None:
+                    update_fields.append('notes = ?')
+                    params.append(notes)
+
+                # 添加更新时间
+                update_fields.append('updated_at = CURRENT_TIMESTAMP')
+                params.append(email)  # WHERE条件的参数
+
+                query = f'''
+                    UPDATE accounts
+                    SET {', '.join(update_fields)}
+                    WHERE email = ? AND deleted_at IS NULL
+                '''
+
+                cursor.execute(query, params)
+                conn.commit()
+
+                if cursor.rowcount > 0:
+                    logger.info(f"账号状态更新成功: {email} -> {status}")
+                    return True
+                else:
+                    logger.warning(f"未找到邮箱为 {email} 的账号")
+                    return False
+
+        except Exception as e:
+            logger.error(f"更新账号状态失败: {str(e)}")
+            return False
+
     def delete_account(self, account_id: int) -> bool:
         """删除账号（软删除）"""
         try:
@@ -404,4 +484,178 @@ class DatabaseManager:
                 
         except Exception as e:
             logger.error(f"获取统计信息失败: {str(e)}")
+            return {}
+
+    # ==================== 任务管理 ====================
+
+    def save_task(self, task_dict: Dict[str, Any]) -> bool:
+        """保存或更新任务"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # 准备数据
+                task_data = {
+                    'id': task_dict['id'],
+                    'config': json.dumps(task_dict['config']),
+                    'status': task_dict['status'],
+                    'current_step': task_dict.get('current_step'),
+                    'progress': task_dict.get('progress', 0.0),
+                    'created_at': task_dict['created_at'],
+                    'started_at': task_dict.get('started_at'),
+                    'completed_at': task_dict.get('completed_at'),
+                    'error_message': task_dict.get('error_message'),
+                    'logs': json.dumps(task_dict.get('logs', [])),
+                    'celery_task_id': task_dict.get('celery_task_id'),
+                    'last_updated': datetime.now().isoformat()
+                }
+
+                # 使用REPLACE INTO进行插入或更新
+                cursor.execute('''
+                    REPLACE INTO tasks (
+                        id, config, status, current_step, progress,
+                        created_at, started_at, completed_at, error_message,
+                        logs, celery_task_id, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    task_data['id'], task_data['config'], task_data['status'],
+                    task_data['current_step'], task_data['progress'],
+                    task_data['created_at'], task_data['started_at'],
+                    task_data['completed_at'], task_data['error_message'],
+                    task_data['logs'], task_data['celery_task_id'],
+                    task_data['last_updated']
+                ))
+
+                conn.commit()
+                return True
+
+        except Exception as e:
+            logger.error(f"❌ 保存任务失败: {task_dict.get('id', 'unknown')} - {e}")
+            return False
+
+    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """获取单个任务"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
+                row = cursor.fetchone()
+
+                if row:
+                    return self._row_to_task_dict(row)
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ 获取任务失败: {task_id} - {e}")
+            return None
+
+    def get_all_tasks(self, limit: int = None, offset: int = 0) -> List[Dict[str, Any]]:
+        """获取所有任务"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                query = 'SELECT * FROM tasks ORDER BY created_at DESC'
+                params = []
+
+                if limit:
+                    query += ' LIMIT ? OFFSET ?'
+                    params.extend([limit, offset])
+
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+
+                return [self._row_to_task_dict(row) for row in rows]
+
+        except Exception as e:
+            logger.error(f"❌ 获取所有任务失败: {e}")
+            return []
+
+    def delete_task(self, task_id: str) -> bool:
+        """从数据库中删除任务"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+                conn.commit()
+
+                deleted_count = cursor.rowcount
+                if deleted_count > 0:
+                    logger.info(f"✅ 任务已从数据库删除: {task_id}")
+                    return True
+                else:
+                    logger.warning(f"⚠️ 数据库中未找到任务: {task_id}")
+                    return False
+
+        except Exception as e:
+            logger.error(f"❌ 从数据库删除任务失败: {task_id} - {e}")
+            return False
+
+    def get_tasks_by_status(self, status: str) -> List[Dict[str, Any]]:
+        """根据状态获取任务"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    'SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC',
+                    (status,)
+                )
+                rows = cursor.fetchall()
+
+                return [self._row_to_task_dict(row) for row in rows]
+
+        except Exception as e:
+            logger.error(f"❌ 根据状态获取任务失败: {status} - {e}")
+            return []
+
+    def get_task_stats(self) -> Dict[str, int]:
+        """获取任务统计信息"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute('''
+                    SELECT
+                        status,
+                        COUNT(*) as count
+                    FROM tasks
+                    GROUP BY status
+                ''')
+
+                stats = {'total': 0, 'pending': 0, 'running': 0, 'completed': 0, 'failed': 0, 'cancelled': 0}
+
+                for row in cursor.fetchall():
+                    status, count = row
+                    if status in stats:
+                        stats[status] = count
+                    stats['total'] += count
+
+                return stats
+
+        except Exception as e:
+            logger.error(f"❌ 获取任务统计失败: {e}")
+            return {'total': 0, 'pending': 0, 'running': 0, 'completed': 0, 'failed': 0, 'cancelled': 0}
+
+    def _row_to_task_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        """将数据库行转换为任务字典"""
+        try:
+            task_dict = {
+                'id': row['id'],
+                'config': json.loads(row['config']) if row['config'] else {},
+                'status': row['status'],
+                'current_step': row['current_step'],
+                'progress': row['progress'] or 0.0,
+                'created_at': row['created_at'],
+                'started_at': row['started_at'],
+                'completed_at': row['completed_at'],
+                'error_message': row['error_message'],
+                'logs': json.loads(row['logs']) if row['logs'] else [],
+                'celery_task_id': row['celery_task_id'],
+                'last_updated': row['last_updated']
+            }
+            return task_dict
+
+        except Exception as e:
+            logger.error(f"❌ 转换数据库行失败: {e}")
             return {}

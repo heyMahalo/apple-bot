@@ -6,12 +6,28 @@ import uuid
 
 class TaskStatus(Enum):
     PENDING = "pending"
-    RUNNING = "running"  
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+    # 🚀 四个阶段状态
+    STAGE_1_PRODUCT_CONFIG = "stage_1_product_config"      # 阶段1：产品配置
+    STAGE_2_ACCOUNT_LOGIN = "stage_2_account_login"        # 阶段2：账号登录
+    STAGE_3_ADDRESS_PHONE = "stage_3_address_phone"        # 阶段3：地址电话配置
+    STAGE_4_GIFT_CARD = "stage_4_gift_card"               # 阶段4：礼品卡配置
+
+    # 特殊状态
+    WAITING_GIFT_CARD_INPUT = "waiting_gift_card_input"  # 等待用户输入礼品卡
+
 class TaskStep(Enum):
+    # 🚀 四大阶段流程
+    STAGE_1_PRODUCT_CONFIG = "stage_1_product_config"      # 阶段1：产品配置
+    STAGE_2_ACCOUNT_LOGIN = "stage_2_account_login"        # 阶段2：账号登录
+    STAGE_3_ADDRESS_PHONE = "stage_3_address_phone"        # 阶段3：地址电话配置
+    STAGE_4_GIFT_CARD = "stage_4_gift_card"               # 阶段4：礼品卡配置
+
+    # 详细步骤（保持兼容性）
     INITIALIZING = "initializing"
     NAVIGATING = "navigating"
     CONFIGURING_PRODUCT = "configuring_product"
@@ -86,8 +102,13 @@ class Task:
     
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
-        result['status'] = self.status.value
-        result['current_step'] = self.current_step.value if self.current_step else None
+        # 安全地获取status值
+        result['status'] = self.status.value if hasattr(self.status, 'value') else str(self.status)
+        # 安全地获取current_step值
+        if self.current_step:
+            result['current_step'] = self.current_step.value if hasattr(self.current_step, 'value') else str(self.current_step)
+        else:
+            result['current_step'] = None
         result['created_at'] = self.created_at.isoformat() if self.created_at else None
         result['started_at'] = self.started_at.isoformat() if self.started_at else None
         result['completed_at'] = self.completed_at.isoformat() if self.completed_at else None
@@ -102,7 +123,14 @@ class Task:
         self.logs.append(log_entry)
         
     def update_progress(self, step: TaskStep, progress: float):
-        self.current_step = step
+        # 确保step是TaskStep枚举，如果是字符串则转换
+        if isinstance(step, str):
+            try:
+                self.current_step = TaskStep(step)
+            except ValueError:
+                self.current_step = step  # 如果转换失败，保持原值
+        else:
+            self.current_step = step
         self.progress = progress
 
     @classmethod
@@ -145,9 +173,24 @@ class Task:
         )
 
         # 设置状态和时间
-        task.status = TaskStatus(data['status'])
+        # 处理status - 可能是字符串或枚举
+        status_value = data['status']
+        if isinstance(status_value, str):
+            task.status = TaskStatus(status_value)
+        else:
+            task.status = status_value
+
         task.progress = data.get('progress', 0)
-        task.current_step = TaskStep(data['current_step']) if data.get('current_step') else None
+
+        # 处理current_step - 可能是字符串或枚举
+        current_step_value = data.get('current_step')
+        if current_step_value:
+            if isinstance(current_step_value, str):
+                task.current_step = TaskStep(current_step_value)
+            else:
+                task.current_step = current_step_value
+        else:
+            task.current_step = None
         task.error_message = data.get('error_message')
 
         # 解析时间

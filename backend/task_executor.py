@@ -100,64 +100,39 @@ class TaskExecutor:
         return analysis
     
     async def execute_task(self, task_data: dict) -> dict:
-        """执行任务"""
+        """执行任务 - 直接调用AutomationService的完整流程"""
         try:
             # 从字典重建Task对象
             task = Task.from_dict(task_data)
 
             logger.info(f"开始执行任务: {task.id}")
 
-            # 分析URL，判断是否需要跳过配置步骤
-            url_analysis = self._analyze_url(task.config.url)
-            task.add_log(f"URL分析结果: {'完整URL，将跳过产品配置' if url_analysis['skip_configuration'] else '需要手动配置产品'}", "info")
+            # 设置任务为运行状态
+            task.status = TaskStatus.RUNNING
+            task.add_log("🚀 任务开始执行", "info")
+            self._send_progress_update(task)
 
-            # 始终包含配置步骤，但会在配置步骤中智能跳过特定选项
-            steps = [
-                (TaskStep.INITIALIZING, 10, "初始化浏览器"),
-                (TaskStep.NAVIGATING, 20, "导航到产品页面"),
-                (TaskStep.CONFIGURING_PRODUCT, 40, "配置产品选项"),
-                (TaskStep.ADDING_TO_BAG, 60, "添加到购物袋"),
-                (TaskStep.CHECKOUT, 80, "进入结账流程"),
-                (TaskStep.APPLYING_GIFT_CARD, 90, "应用礼品卡"),
-                (TaskStep.FINALIZING, 100, "完成购买")
-            ]
+            # 直接调用AutomationService的execute_task方法
+            # 这个方法包含了完整的四阶段流程和实际的浏览器自动化操作
+            success = await self.automation_service.execute_task(task)
 
-            for step, progress, description in steps:
-                if task.status == TaskStatus.CANCELLED:
-                    break
-
-                # 更新进度并立即发送
-                task.update_progress(step, progress)
-                task.add_log(f"🔄 {description}...", "info")
-                self._send_progress_update(task)
-
-                logger.info(f"执行步骤: {step.value} - {description}")
-
-                # 执行具体的自动化步骤
-                success = await self._execute_step(task, step, url_analysis)
-
-                if not success:
-                    task.status = TaskStatus.FAILED
-                    task.add_log(f"❌ 步骤 {description} 失败", "error")
-                    self._send_progress_update(task)
-                    break
+            if success:
+                if task.status == TaskStatus.WAITING_GIFT_CARD_INPUT:
+                    # 任务在礼品卡输入页面暂停，不是真正的完成
+                    task.add_log("⏳ 任务已暂停在礼品卡输入页面，等待用户操作", "info")
                 else:
-                    task.add_log(f"✅ {description} 完成", "success")
-                    self._send_progress_update(task)
+                    # 任务真正完成
+                    task.status = TaskStatus.COMPLETED
+                    task.completed_at = datetime.now()
+                    task.add_log("🎉 任务执行成功", "success")
+            else:
+                task.status = TaskStatus.FAILED
+                task.add_log("❌ 任务执行失败", "error")
 
-                # 步骤间延迟，让用户看到进度变化
-                await asyncio.sleep(1)
-
-            if task.status == TaskStatus.RUNNING:
-                task.status = TaskStatus.COMPLETED
-                task.completed_at = datetime.now()
-                task.add_log("🎉 任务成功完成", "success")
-                self._send_progress_update(task)
+            # 发送最终状态更新
+            self._send_progress_update(task)
 
             logger.info(f"任务执行完成: {task.id}, 状态: {task.status}")
-
-            # 清理资源
-            await self.automation_service.cleanup_task(task.id)
 
             return task.to_dict()
 
@@ -169,33 +144,6 @@ class TaskExecutor:
             self._send_progress_update(task)
             return task.to_dict()
     
-    async def _execute_step(self, task: Task, step: TaskStep, url_analysis: dict = None) -> bool:
-        """执行具体的任务步骤"""
-        try:
-            if step == TaskStep.INITIALIZING:
-                return await self.automation_service.initialize(task)
-            elif step == TaskStep.NAVIGATING:
-                return await self.automation_service.navigate_to_product(task)
-            elif step == TaskStep.CONFIGURING_PRODUCT:
-                # 传递URL分析结果，让自动化服务决定跳过哪些具体选项
-                return await self.automation_service.configure_product(task, url_analysis)
-            elif step == TaskStep.ADDING_TO_BAG:
-                return await self.automation_service.add_to_bag(task)
-            elif step == TaskStep.CHECKOUT:
-                return await self.automation_service.checkout(task)
-            elif step == TaskStep.APPLYING_GIFT_CARD:
-                return await self.automation_service.apply_gift_card(task)
-            elif step == TaskStep.FINALIZING:
-                return await self.automation_service.finalize_purchase(task)
-
-            return True
-
-        except Exception as e:
-            error_msg = f"步骤 {step.value} 执行失败: {str(e)}"
-            logger.error(error_msg)
-            task.add_log(error_msg, "error")
-            return False
-
 async def main():
     """主函数 - 从命令行参数获取任务数据并执行"""
     if len(sys.argv) != 2:

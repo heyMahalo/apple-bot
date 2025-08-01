@@ -11,7 +11,7 @@ class WebSocketService {
 
   init(store, serverUrl = 'http://localhost:5001') {
     this.store = store
-    
+
     this.socket = io(serverUrl, {
       transports: ['websocket', 'polling'],
       timeout: 20000,
@@ -20,7 +20,13 @@ class WebSocketService {
 
     this.setupEventListeners()
     this.store.commit('SET_SOCKET', this.socket)
-    
+
+    // 🚀 自动加入所有任务的实时更新
+    this.socket.on('connect', () => {
+      console.log('✅ Socket.IO连接成功，准备加入任务房间')
+      this.joinAllTaskRooms()
+    })
+
     return this.socket
   }
 
@@ -58,6 +64,60 @@ class WebSocketService {
     this.socket.on('task_update', (task) => {
       console.log('Task updated:', task)
       this.store.commit('UPDATE_TASK', task)
+    })
+
+    // 🚀 SOTA事件监听
+    this.socket.on('task_status_update', (data) => {
+      console.log('📊 SOTA任务状态更新:', data)
+      this.store.commit('UPDATE_TASK_STATUS', {
+        taskId: data.task_id,
+        status: data.status,
+        progress: data.progress,
+        message: data.message
+      })
+    })
+
+    this.socket.on('step_update', (data) => {
+      console.log('🔄 SOTA步骤更新:', data)
+      this.store.commit('UPDATE_TASK_STEP', {
+        taskId: data.task_id,
+        step: data.step,
+        progress: data.progress,
+        message: data.message
+      })
+    })
+
+    this.socket.on('task_log', (data) => {
+      console.log('📝 SOTA任务日志:', data)
+      this.store.commit('ADD_TASK_LOG', {
+        taskId: data.task_id,
+        log: {
+          level: data.level,
+          message: data.message,
+          timestamp: data.timestamp
+        }
+      })
+    })
+
+    // 🚀 交互式提示事件
+    this.socket.on('prompt_required', (data) => {
+      console.log('💬 收到交互式提示:', data)
+      this.store.commit('SET_PROMPT', data)
+    })
+
+    // 🚀 任务快照事件
+    this.socket.on('task_snapshot', (data) => {
+      console.log('📸 收到任务快照:', data)
+      this.store.commit('UPDATE_TASK_SNAPSHOT', data)
+    })
+
+    // 🚀 网关连接事件
+    this.socket.on('connected', (data) => {
+      console.log('🚀 Socket.IO网关连接成功:', data)
+    })
+
+    this.socket.on('joined_task', (data) => {
+      console.log('✅ 已加入任务房间:', data)
     })
 
     this.socket.on('task_deleted', (data) => {
@@ -186,6 +246,43 @@ class WebSocketService {
       this.socket = null
       this.isConnected = false
     }
+  }
+
+  // 🚀 SOTA方法：加入所有任务房间
+  joinAllTaskRooms() {
+    if (!this.socket || !this.store) return
+
+    const tasks = this.store.getters.getTasks
+    tasks.forEach(task => {
+      this.joinTaskRoom(task.id)
+    })
+  }
+
+  // 🚀 加入特定任务房间
+  joinTaskRoom(taskId) {
+    if (!this.socket) return
+
+    console.log(`🔗 加入任务房间: ${taskId}`)
+    this.socket.emit('join_task', { task_id: taskId })
+  }
+
+  // 🚀 离开任务房间
+  leaveTaskRoom(taskId) {
+    if (!this.socket) return
+
+    console.log(`🔗 离开任务房间: ${taskId}`)
+    this.socket.emit('leave_task', { task_id: taskId })
+  }
+
+  // 🚀 提交礼品卡输入
+  submitGiftCardInput(taskId, giftCardData) {
+    if (!this.socket) return
+
+    console.log(`🎁 提交礼品卡输入: ${taskId}`, giftCardData)
+    this.socket.emit('gift_card_input', {
+      task_id: taskId,
+      gift_card_data: giftCardData
+    })
   }
 }
 

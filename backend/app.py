@@ -9,7 +9,9 @@ from config.config import config
 from task_manager import TaskManager
 from websocket_handler import WebSocketHandler
 from services.ip_service import IPService
+from services.automation_service import AutomationService
 from models.database import DatabaseManager, GiftCardStatus
+from models.task import TaskStatus
 
 # 配置日志
 logging.basicConfig(
@@ -30,41 +32,116 @@ def create_app(config_name='default'):
     # 启用CORS支持跨域请求
     CORS(app, origins="*")
     
-    # 初始化SocketIO
+    # 初始化SocketIO - 使用threading模式以兼容Playwright
     socketio = SocketIO(
-        app, 
+        app,
         cors_allowed_origins="*",
-        async_mode='eventlet',
+        async_mode='threading',
         logger=True,
         engineio_logger=True
     )
     
-    # 初始化服务
-    task_manager = TaskManager(max_workers=app.config['MAX_CONCURRENT_TASKS'])
+    # 🚀 优化启动速度：先初始化基础服务
+    logger.info("🚀 正在初始化服务...")
+
+    # 初始化IP服务（只初始化一次）
     ip_service = IPService(
         proxy_api_url=app.config.get('PROXY_API_URL', ''),
         rotation_enabled=app.config.get('PROXY_ROTATION_ENABLED', False)
     )
 
+    # 初始化数据库管理器
+    db_manager = DatabaseManager()
+
+    # 🚀 初始化任务管理器（支持Celery）
+    use_celery = app.config.get('USE_CELERY', True)
+    task_manager = TaskManager(
+        max_workers=app.config['MAX_CONCURRENT_TASKS'],
+        use_celery=use_celery
+    )
+
+    # 初始化自动化服务（传入IP服务避免重复初始化）
+    automation_service = AutomationService(ip_service=ip_service)
+
+    # 设置TaskManager的自动化服务
+    task_manager.set_automation_service(automation_service)
+
     # 初始化WebSocket处理器
     websocket_handler = WebSocketHandler(socketio, task_manager)
 
-    # 初始化数据库管理器
-    db_manager = DatabaseManager()
-    
-    # 初始化IP代理池
-    ip_service.initialize_proxy_pool()
+    # 🚀 异步初始化耗时服务，避免阻塞启动
+    def init_services_async():
+        try:
+            # 初始化IP代理池
+            ip_service.initialize_proxy_pool()
+            logger.info("✅ IP代理池初始化完成")
+
+            # 初始化消息服务（如果还没有初始化）
+            from services.message_service import get_message_service
+            from services.message_service_sota import get_sota_message_service
+
+            message_service = get_message_service()
+            sota_service = get_sota_message_service()
+            logger.info("✅ 消息服务初始化完成")
+
+        except Exception as e:
+            logger.error(f"❌ 异步服务初始化失败: {e}")
+
+    import threading
+    services_init_thread = threading.Thread(target=init_services_async, daemon=True)
+    services_init_thread.start()
+
+    # 🚀 启动Celery事件监听器
+    if use_celery:
+        def start_celery_event_listener():
+            """启动Celery事件监听器"""
+            import redis
+            import json
+            import threading
+
+            def listen_celery_events():
+                try:
+                    redis_client = redis.Redis.from_url('redis://localhost:6379/0')
+                    pubsub = redis_client.pubsub()
+                    pubsub.subscribe('celery_events')
+
+                    logger.info("🚀 Celery事件监听器已启动")
+
+                    for message in pubsub.listen():
+                        if message['type'] == 'message':
+                            try:
+                                event_data = json.loads(message['data'])
+                                event_name = event_data['event']
+                                data = event_data['data']
+
+                                # 转发到WebSocket
+                                websocket_handler.broadcast(event_name, data)
+                                logger.debug(f"📡 转发Celery事件: {event_name}")
+
+                            except Exception as e:
+                                logger.error(f"❌ 处理Celery事件失败: {e}")
+
+                except Exception as e:
+                    logger.error(f"❌ Celery事件监听器失败: {e}")
+
+            # 在后台线程中运行
+            listener_thread = threading.Thread(target=listen_celery_events, daemon=True)
+            listener_thread.start()
+
+        start_celery_event_listener()
+
+    logger.info("✅ 核心服务初始化完成，后台服务正在异步加载")
     
     # REST API 路由
     @app.route('/', methods=['GET'])
     def index():
         """主页重定向到前端界面"""
-        return send_from_directory('../frontend', 'simple.html')
+        return send_from_directory('../frontend', 'inedx.html')
     
     @app.route('/simple.html', methods=['GET']) 
     def frontend():
         """前端界面"""
-        return send_from_directory('../frontend', 'simple.html')
+        return send_from_directory('../frontend', 'index.html')
     
     @app.route('/api/health', methods=['GET'])
     def health_check():
@@ -80,6 +157,29 @@ def create_app(config_name='default'):
         """获取所有任务"""
         tasks = [task.to_dict() for task in task_manager.get_all_tasks()]
         return jsonify({'tasks': tasks})
+
+    @app.route('/api/tasks/active', methods=['GET'])
+    def get_active_tasks():
+        """获取活跃任务 - 用于智能轮询"""
+        try:
+            # 获取活跃任务
+            active_tasks = task_manager.get_active_tasks()
+
+            # 记录活跃任务检查
+            all_tasks = task_manager.get_all_tasks()
+            logger.info(f"📋 检查活跃任务: 总任务数={len(all_tasks)}")
+            for task in active_tasks:
+                logger.info(f"📋 任务 {task.id[:8]}: 状态={task.status}, Celery任务={task.id in task_manager.celery_tasks}")
+
+            logger.info(f"📋 返回 {len(active_tasks)} 个活跃任务")
+
+            # 返回任务字典列表和额外信息
+            result = [task.to_dict() for task in active_tasks]
+            return jsonify(result)
+
+        except Exception as e:
+            logger.error(f"获取活跃任务失败: {e}")
+            return jsonify({'error': str(e)}), 500
     
     @app.route('/api/tasks/<task_id>', methods=['GET'])
     def get_task(task_id):
@@ -213,20 +313,189 @@ def create_app(config_name='default'):
         """启动任务"""
         success = task_manager.start_task(task_id, websocket_handler)
         if success:
+            # 🚀 立即发送启动成功事件，确保前端快速响应
+            if websocket_handler:
+                websocket_handler.broadcast('task_start_success', {'task_id': task_id})
             return jsonify({'success': True, 'message': 'Task started'})
-        return jsonify({'error': 'Failed to start task'}), 400
+        else:
+            # 发送启动失败事件
+            if websocket_handler:
+                websocket_handler.broadcast('task_start_error', {
+                    'task_id': task_id,
+                    'message': 'Failed to start task'
+                })
+            return jsonify({'error': 'Failed to start task'}), 400
     
     @app.route('/api/tasks/<task_id>/cancel', methods=['POST'])
     def cancel_task(task_id):
         """取消任务"""
         success = task_manager.cancel_task(task_id)
         if success:
+            # 🚀 立即发送取消成功事件
+            if websocket_handler:
+                websocket_handler.broadcast('task_cancel_success', {'task_id': task_id})
+
             task = task_manager.get_task(task_id)
             if task:
                 websocket_handler.broadcast('task_update', task.to_dict())
             return jsonify({'success': True, 'message': 'Task cancelled'})
-        return jsonify({'error': 'Failed to cancel task'}), 400
-    
+        else:
+            # 发送取消失败事件
+            if websocket_handler:
+                websocket_handler.broadcast('task_cancel_error', {
+                    'task_id': task_id,
+                    'message': 'Failed to cancel task'
+                })
+            return jsonify({'error': 'Failed to cancel task'}), 400
+
+    @app.route('/api/tasks/<task_id>/gift-card', methods=['POST'])
+    def submit_gift_card(task_id):
+        """提交任务的礼品卡信息"""
+        try:
+            data = request.get_json()
+            code = data.get('code', '').strip().upper()  # 转换为大写
+            note = data.get('note', '').strip()
+
+            if not code:
+                return jsonify({'error': '礼品卡号码不能为空'}), 400
+
+            # 验证礼品卡号码格式（16位字母数字组合）
+            import re
+            if not re.match(r'^[A-Z0-9]{16}$', code):
+                return jsonify({'error': '礼品卡号码格式错误，应为16位字母数字组合'}), 400
+
+            logger.info(f"🎁 收到任务 {task_id} 的礼品卡信息: {code[:4]}****")
+
+            # 获取任务
+            task = task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
+
+            if task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
+                return jsonify({'error': f'任务状态错误，当前状态: {task.status.value}'}), 400
+
+            # 更新任务的礼品卡信息
+            from models.task import GiftCard
+            gift_card = GiftCard(number=code)
+
+            # 如果任务配置中没有礼品卡，添加一个
+            if not task.config.gift_cards:
+                task.config.gift_cards = []
+
+            # 添加新的礼品卡或更新现有的
+            task.config.gift_cards.append(gift_card)
+            task.config.gift_card_code = code  # 向后兼容
+
+            # 添加日志
+            task.add_log(f"🎁 收到礼品卡信息: {code[:4]}****", "info")
+
+            # 更新任务状态为继续执行
+            task.status = TaskStatus.STAGE_4_GIFT_CARD
+            task.current_step = "stage_4_gift_card"
+            task.add_log("🔄 礼品卡信息已提交，任务继续执行", "success")
+
+            # 保存任务到数据库
+            task_manager._persist_task(task)
+
+            # 发送WebSocket更新
+            if websocket_handler:
+                websocket_handler.broadcast('task_update', task.to_dict())
+                websocket_handler.broadcast('task_status_update', {
+                    'task_id': task_id,
+                    'status': task.status.value,
+                    'progress': task.progress,
+                    'message': '礼品卡信息已提交，任务继续执行'
+                })
+
+            # 简化逻辑：只更新任务状态，让等待循环自然退出
+            logger.info(f"🔄 礼品卡信息已保存，更新任务状态让等待循环退出")
+            # 将任务状态从 WAITING_GIFT_CARD_INPUT 改为 STAGE_4_GIFT_CARD
+            # 这样 _handle_gift_card_input 中的等待循环会检测到状态变化并退出
+            task.status = TaskStatus.STAGE_4_GIFT_CARD
+            logger.info(f"✅ 任务状态已更新为 {task.status}，等待循环将自动退出")
+
+            return jsonify({
+                'success': True,
+                'message': '礼品卡信息已提交，任务继续执行',
+                'task_status': task.status.value
+            })
+
+        except Exception as e:
+            logger.error(f"❌ 提交礼品卡信息失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/tasks/<task_id>/trigger-gift-card-input', methods=['POST'])
+    def trigger_gift_card_input(task_id):
+        """手动触发礼品卡输入事件（用于测试）"""
+        try:
+            task = task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
+
+            if task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
+                return jsonify({'error': f'任务状态错误，当前状态: {task.status.value}'}), 400
+
+            # 发送礼品卡输入请求事件
+            if websocket_handler:
+                websocket_handler.send_task_event("gift_card_input_required", task_id, {
+                    "message": "请在下方输入礼品卡信息，点击确认后系统将自动继续执行",
+                    "status": "waiting_gift_card_input",
+                    "task_name": task.config.name,
+                    "current_step": "礼品卡输入"
+                })
+
+            return jsonify({
+                'success': True,
+                'message': '礼品卡输入事件已触发'
+            })
+
+        except Exception as e:
+            logger.error(f"❌ 触发礼品卡输入事件失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/tasks/<task_id>/set-status/<status>', methods=['POST'])
+    def set_task_status(task_id, status):
+        """设置任务状态（用于测试）"""
+        try:
+            task = task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
+
+            # 设置任务状态
+            if status == 'waiting_gift_card_input':
+                task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+            elif status == 'running':
+                task.status = TaskStatus.RUNNING
+            elif status == 'completed':
+                task.status = TaskStatus.COMPLETED
+            elif status == 'failed':
+                task.status = TaskStatus.FAILED
+            else:
+                return jsonify({'error': f'不支持的状态: {status}'}), 400
+
+            # 保存任务
+            task_manager._persist_task(task)
+
+            # 发送WebSocket更新
+            if websocket_handler:
+                websocket_handler.broadcast('task_update', task.to_dict())
+                websocket_handler.broadcast('task_status_update', {
+                    'task_id': task_id,
+                    'status': task.status.value,
+                    'progress': task.progress,
+                    'message': f'任务状态已设置为: {status}'
+                })
+
+            return jsonify({
+                'success': True,
+                'message': f'任务状态已设置为: {status}',
+                'task_status': task.status.value
+            })
+
+        except Exception as e:
+            logger.error(f"❌ 设置任务状态失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
     @app.route('/api/system/status', methods=['GET'])
     def get_system_status():
         """获取系统状态"""
@@ -535,126 +804,179 @@ def create_app(config_name='default'):
                         'iPhone 14 Pro',
                         'iPhone 14',
                         'iPhone 13 Pro',
-                        'iPhone 13',
-                        'iPhone 12 Pro',
-                        'iPhone 12'
-                    ],
-                    'payment_options': [
-                        'Buy',
-                        'Monthly Installments'
-                    ],
-                    'apple_care_options': [
-                        'No AppleCare+ Coverage',
-                        'Monthly coverage until cancelled',
-                        'Two years of coverage',
-                        'AppleCare+ for iPhone',
-                        'AppleCare+ with Theft and Loss'
+                        'iPhone 13'
                     ]
                 }
-                
-                logger.info(f"Loaded product options from iPhone data: {len(options['products'])} products")
-                return jsonify(options)
-                
+
+                product_configs = {
+                    'iphone': {
+                        'options': options
+                    }
+                }
+
+                return jsonify(product_configs)
             else:
-                logger.warning(f"iPhone data file not found at {iphone_data_path}, using fallback data")
-                
+                # 如果文件不存在，返回默认配置
+                return jsonify({
+                    'iphone': {
+                        'options': {
+                            'models': ['iPhone 16 Pro', 'iPhone 16'],
+                            'finishes': ['Natural Titanium', 'Black Titanium'],
+                            'storages': ['128GB', '256GB', '512GB', '1TB'],
+                            'trade_in_options': ['No trade-in']
+                        }
+                    }
+                })
+
         except Exception as e:
-            logger.error(f"Failed to load iPhone data: {str(e)}")
-        
-        # 如果读取失败，返回默认数据
-        fallback_options = {
-            'products': [
-                'iPhone 16 Pro & iPhone 16 Pro Max',
-                'iPhone 16 & iPhone 16 Plus', 
-                'iPhone 15 & iPhone 15 Plus'
-            ],
-            'product_urls': {
-                'iPhone 16 Pro & iPhone 16 Pro Max': 'https://www.apple.com/uk/shop/buy-iphone/iphone-16-pro',
-                'iPhone 16 & iPhone 16 Plus': 'https://www.apple.com/uk/shop/buy-iphone/iphone-16',
-                'iPhone 15 & iPhone 15 Plus': 'https://www.apple.com/uk/shop/buy-iphone/iphone-15'
-            },
-            'models': [
-                'iPhone 16 Pro',
-                'iPhone 16 Pro Max',
-                'iPhone 16',
-                'iPhone 16 Plus'
-            ],
-            'finishes': [
-                'Natural Titanium',
-                'Blue Titanium',
-                'White Titanium',
-                'Black Titanium'
-            ],
-            'storages': [
-                '128GB',
-                '256GB',
-                '512GB',
-                '1TB'
-            ],
-            'trade_in_options': [
-                'No trade-in',
-                'iPhone 15 Pro',
-                'iPhone 14 Pro',
-                'iPhone 13 Pro'
-            ],
-            'payment_options': [
-                'Buy',
-                'Monthly Installments'
-            ],
-            'apple_care_options': [
-                'No AppleCare+ Coverage',
-                'AppleCare+ for iPhone',
-                'AppleCare+ with Theft and Loss'
-            ]
-        }
-        return jsonify(fallback_options)
+            logger.error(f"获取产品配置选项失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
 
-    # ==================== 数据库管理API ====================
+    @app.route('/api/tasks/<task_id>/debug-browser', methods=['GET'])
+    def debug_browser_status(task_id):
+        """调试浏览器状态"""
+        try:
+            task = task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
 
-    # 账号管理API
+            debug_info = {
+                'task_id': task_id,
+                'task_status': task.status.value,
+                'automation_service_available': task_manager.automation_service is not None,
+                'browser_page_exists': False,
+                'page_url': None,
+                'page_title': None
+            }
+
+            if task_manager.automation_service:
+                # 检查浏览器页面是否存在
+                page = task_manager.automation_service.pages.get(task_id)
+                if page:
+                    debug_info['browser_page_exists'] = True
+                    try:
+                        debug_info['page_url'] = page.url
+                        debug_info['page_title'] = page.title()
+                    except Exception as e:
+                        debug_info['page_error'] = str(e)
+
+            return jsonify(debug_info)
+
+        except Exception as e:
+            logger.error(f"调试浏览器状态失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    # 🎁 礼品卡管理API
+    @app.route('/api/gift-cards', methods=['GET'])
+    def get_gift_cards():
+        """获取所有礼品卡"""
+        try:
+            db_manager = DatabaseManager()
+            gift_cards = db_manager.get_all_gift_cards()
+            return jsonify(gift_cards)
+        except Exception as e:
+            logger.error(f"获取礼品卡失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/gift-cards', methods=['POST'])
+    def add_gift_card():
+        """添加新礼品卡"""
+        try:
+            data = request.get_json()
+            gift_card_number = data.get('gift_card_number', '').strip().upper()
+            status = data.get('status', '有额度')
+            notes = data.get('notes', '')
+
+            if not gift_card_number:
+                return jsonify({'error': '礼品卡号码不能为空'}), 400
+
+            # 验证礼品卡号码格式
+            import re
+            if not re.match(r'^[A-Z0-9]{16}$', gift_card_number):
+                return jsonify({'error': '礼品卡号码格式错误，应为16位字母数字组合'}), 400
+
+            db_manager = DatabaseManager()
+            gift_card_id = db_manager.add_gift_card(gift_card_number, status, notes)
+
+            return jsonify({
+                'success': True,
+                'message': '礼品卡添加成功',
+                'gift_card_id': gift_card_id
+            })
+        except Exception as e:
+            logger.error(f"添加礼品卡失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/gift-cards/<int:gift_card_id>', methods=['PUT'])
+    def update_gift_card(gift_card_id):
+        """更新礼品卡"""
+        try:
+            data = request.get_json()
+            status = data.get('status')
+            notes = data.get('notes')
+
+            db_manager = DatabaseManager()
+            success = db_manager.update_gift_card(gift_card_id, status, notes)
+
+            if success:
+                return jsonify({'success': True, 'message': '礼品卡更新成功'})
+            else:
+                return jsonify({'error': '礼品卡不存在'}), 404
+        except Exception as e:
+            logger.error(f"更新礼品卡失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/gift-cards/<int:gift_card_id>', methods=['DELETE'])
+    def delete_gift_card(gift_card_id):
+        """删除礼品卡"""
+        try:
+            db_manager = DatabaseManager()
+            success = db_manager.delete_gift_card(gift_card_id)
+
+            if success:
+                return jsonify({'success': True, 'message': '礼品卡删除成功'})
+            else:
+                return jsonify({'error': '礼品卡不存在'}), 404
+        except Exception as e:
+            logger.error(f"删除礼品卡失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    # 👤 账号管理API
     @app.route('/api/accounts', methods=['GET'])
     def get_accounts():
         """获取所有账号"""
         try:
+            db_manager = DatabaseManager()
             accounts = db_manager.get_all_accounts()
-            return jsonify([{
-                'id': acc.id,
-                'email': acc.email,
-                'password': acc.password,  # 包含密码用于任务创建
-                'phone_number': acc.phone_number,
-                'created_at': acc.created_at,
-                'updated_at': acc.updated_at,
-                'is_active': acc.is_active
-            } for acc in accounts])
+            return jsonify(accounts)
         except Exception as e:
-            logger.error(f"获取账号列表失败: {str(e)}")
+            logger.error(f"获取账号失败: {str(e)}")
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/accounts', methods=['POST'])
-    def create_account():
-        """创建账号"""
+    def add_account():
+        """添加新账号"""
         try:
             data = request.get_json()
-            email = data.get('email')
-            password = data.get('password')
-            phone_number = data.get('phone_number', '+447700900000')  # 默认英国号码
+            email = data.get('email', '').strip()
+            password = data.get('password', '').strip()
+            phone_number = data.get('phone_number', '').strip()
+            status = data.get('status', '可用')
+            notes = data.get('notes', '')
 
             if not email or not password:
                 return jsonify({'error': '邮箱和密码不能为空'}), 400
 
-            account = db_manager.create_account(email, password, phone_number)
-            return jsonify({
-                'id': account.id,
-                'email': account.email,
-                'phone_number': account.phone_number,
-                'created_at': account.created_at,
-                'is_active': account.is_active
-            }), 201
+            db_manager = DatabaseManager()
+            account_id = db_manager.add_account(email, password, phone_number, status, notes)
 
-        except ValueError as e:
-            return jsonify({'error': str(e)}), 400
+            return jsonify({
+                'success': True,
+                'message': '账号添加成功',
+                'account_id': account_id
+            })
         except Exception as e:
-            logger.error(f"创建账号失败: {str(e)}")
+            logger.error(f"添加账号失败: {str(e)}")
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/accounts/<int:account_id>', methods=['PUT'])
@@ -662,23 +984,18 @@ def create_app(config_name='default'):
         """更新账号"""
         try:
             data = request.get_json()
-            email = data.get('email')
             password = data.get('password')
             phone_number = data.get('phone_number')
+            status = data.get('status')
+            notes = data.get('notes')
 
-            success = db_manager.update_account(account_id, email, password, phone_number)
+            db_manager = DatabaseManager()
+            success = db_manager.update_account(account_id, password, phone_number, status, notes)
+
             if success:
-                account = db_manager.get_account_by_id(account_id)
-                return jsonify({
-                    'id': account.id,
-                    'email': account.email,
-                    'phone_number': account.phone_number,
-                    'updated_at': account.updated_at,
-                    'is_active': account.is_active
-                })
+                return jsonify({'success': True, 'message': '账号更新成功'})
             else:
                 return jsonify({'error': '账号不存在'}), 404
-
         except Exception as e:
             logger.error(f"更新账号失败: {str(e)}")
             return jsonify({'error': str(e)}), 500
@@ -687,149 +1004,19 @@ def create_app(config_name='default'):
     def delete_account(account_id):
         """删除账号"""
         try:
+            db_manager = DatabaseManager()
             success = db_manager.delete_account(account_id)
+
             if success:
-                return jsonify({'message': '账号删除成功'})
+                return jsonify({'success': True, 'message': '账号删除成功'})
             else:
                 return jsonify({'error': '账号不存在'}), 404
-
         except Exception as e:
             logger.error(f"删除账号失败: {str(e)}")
             return jsonify({'error': str(e)}), 500
 
-    # 礼品卡管理API
-    @app.route('/api/gift-cards', methods=['GET'])
-    def get_gift_cards():
-        """获取所有礼品卡"""
-        try:
-            status_filter = request.args.get('status')
-            gift_cards = db_manager.get_all_gift_cards(status_filter=status_filter)
-            return jsonify([{
-                'id': card.id,
-                'gift_card_number': card.gift_card_number,
-                'status': card.status,
-                'notes': card.notes,
-                'created_at': card.created_at,
-                'updated_at': card.updated_at,
-                'is_active': card.is_active
-            } for card in gift_cards])
-        except Exception as e:
-            logger.error(f"获取礼品卡列表失败: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/gift-cards', methods=['POST'])
-    def create_gift_card():
-        """创建礼品卡"""
-        try:
-            data = request.get_json()
-            gift_card_number = data.get('gift_card_number')
-            status = data.get('status', GiftCardStatus.HAS_BALANCE.value)
-            notes = data.get('notes', '')
-
-            if not gift_card_number:
-                return jsonify({'error': '礼品卡号不能为空'}), 400
-
-            gift_card = db_manager.create_gift_card(gift_card_number, status, notes)
-            return jsonify({
-                'id': gift_card.id,
-                'gift_card_number': gift_card.gift_card_number,
-                'status': gift_card.status,
-                'notes': gift_card.notes,
-                'created_at': gift_card.created_at,
-                'is_active': gift_card.is_active
-            }), 201
-
-        except ValueError as e:
-            return jsonify({'error': str(e)}), 400
-        except Exception as e:
-            logger.error(f"创建礼品卡失败: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/gift-cards/<int:card_id>', methods=['PUT'])
-    def update_gift_card(card_id):
-        """更新礼品卡"""
-        try:
-            data = request.get_json()
-            gift_card_number = data.get('gift_card_number')
-            status = data.get('status')
-            notes = data.get('notes')
-
-            success = db_manager.update_gift_card(card_id, gift_card_number, status, notes)
-            if success:
-                gift_card = db_manager.get_gift_card_by_id(card_id)
-                return jsonify({
-                    'id': gift_card.id,
-                    'gift_card_number': gift_card.gift_card_number,
-                    'status': gift_card.status,
-                    'notes': gift_card.notes,
-                    'updated_at': gift_card.updated_at,
-                    'is_active': gift_card.is_active
-                })
-            else:
-                return jsonify({'error': '礼品卡不存在'}), 404
-
-        except Exception as e:
-            logger.error(f"更新礼品卡失败: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/gift-cards/<int:card_id>', methods=['DELETE'])
-    def delete_gift_card(card_id):
-        """删除礼品卡"""
-        try:
-            success = db_manager.delete_gift_card(card_id)
-            if success:
-                return jsonify({'message': '礼品卡删除成功'})
-            else:
-                return jsonify({'error': '礼品卡不存在'}), 404
-
-        except Exception as e:
-            logger.error(f"删除礼品卡失败: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/gift-card-statuses', methods=['GET'])
-    def get_gift_card_statuses():
-        """获取礼品卡状态选项"""
-        return jsonify([status.value for status in GiftCardStatus])
-
-    @app.route('/api/statistics', methods=['GET'])
-    def get_statistics():
-        """获取统计信息"""
-        try:
-            stats = db_manager.get_statistics()
-            return jsonify(stats)
-        except Exception as e:
-            logger.error(f"获取统计信息失败: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-    # 错误处理
-    @app.errorhandler(404)
-    def not_found(error):
-        return jsonify({'error': 'Not found'}), 404
-    
-    @app.errorhandler(500)
-    def internal_error(error):
-        return jsonify({'error': 'Internal server error'}), 500
-    
-    # 存储到app上下文中，方便其他地方使用
-    app.task_manager = task_manager
-    app.websocket_handler = websocket_handler
-    app.ip_service = ip_service
-    
-    return app, socketio
+    return app
 
 if __name__ == '__main__':
-    config_name = os.environ.get('FLASK_CONFIG', 'development')
-    app, socketio = create_app(config_name)
-    
-    logger.info("Starting Apple Bot System...")
-    logger.info(f"Config: {config_name}")
-    logger.info(f"Debug mode: {app.config['DEBUG']}")
-    
-    # 启动应用
-    port = int(os.environ.get('PORT', 5001))  # 改为5001端口，支持环境变量配置
-    socketio.run(
-        app,
-        host='0.0.0.0',
-        port=port,
-        debug=app.config['DEBUG']
-    )
+    app = create_app()
+    app.run(host='0.0.0.0', port=5001, debug=True)

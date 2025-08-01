@@ -20,6 +20,7 @@ class Config:
     # 自动化配置
     MAX_CONCURRENT_TASKS = int(os.environ.get('MAX_CONCURRENT_TASKS', '3'))
     TASK_TIMEOUT = int(os.environ.get('TASK_TIMEOUT', '1800'))  # 30分钟
+    USE_CELERY = os.environ.get('USE_CELERY', 'False').lower() == 'true'  # 🚀 禁用Celery以支持GUI显示
     
     # IP代理配置 (预留)
     PROXY_ROTATION_ENABLED = os.environ.get('PROXY_ROTATION_ENABLED', 'False').lower() == 'true'

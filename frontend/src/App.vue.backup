@@ -871,7 +871,7 @@
             <el-option
               v-for="card in giftCards"
               :key="card.id"
-              :label="`${card.gift_card_number} (${card.status})`"
+              :label="`${card.number} (余额: $${card.balance})`"
               :value="card.id"
             />
           </el-select>
@@ -1145,7 +1145,7 @@
           <p><strong>任务名称：</strong>{{ waitingGiftCardTask.config?.name }}</p>
           <p><strong>当前状态：</strong>等待输入礼品卡</p>
 
-          <el-divider />
+          <el-divider></el-divider>
 
           <h4>礼品卡信息</h4>
           <el-form :model="taskGiftCardForm" label-width="120px" ref="giftCardFormRef">
@@ -1563,12 +1563,6 @@ const initWebSocket = () => {
     socket.value.on('gift_card_input_required', (data) => {
       console.log('🎁 收到礼品卡输入请求:', data)
       handleGiftCardInputRequired(data)
-    })
-
-    // 礼品卡状态更新事件
-    socket.value.on('gift_card_status_update', (data) => {
-      console.log('🎁 收到礼品卡状态更新:', data)
-      handleGiftCardStatusUpdate(data)
     })
 
     // 任务日志事件
@@ -2127,7 +2121,7 @@ const getTasksByProduct = (productType) => {
 
   console.log(`🔍 筛选 ${productType} 任务，总任务数:`, tasks.value.length)
 
-  // 🚀 只显示活跃任务，但不包括失败和完成的任务（避免闪烁）
+  // 🚀 只显示待运行和正在运行的任务
   const activeStatuses = ['pending', 'running', 'stage_1_product_config', 'stage_2_account_login', 'stage_3_address_phone', 'stage_4_gift_card', 'waiting_gift_card_input']
 
   const filteredTasks = tasks.value.filter(task => {
@@ -3366,45 +3360,6 @@ const handleGiftCardInputRequired = (data) => {
     }
   } catch (error) {
     console.error('处理礼品卡输入请求错误:', error)
-  }
-}
-
-// 处理礼品卡状态更新
-const handleGiftCardStatusUpdate = (data) => {
-  try {
-    console.log('🎁 处理礼品卡状态更新:', data)
-
-    const { gift_card_number, status, message } = data
-
-    if (!gift_card_number || !status) {
-      console.warn('⚠️ 无效的礼品卡状态更新数据')
-      return
-    }
-
-    // 更新本地礼品卡列表中的状态
-    const giftCard = giftCards.value.find(card => card.gift_card_number === gift_card_number)
-    if (giftCard) {
-      giftCard.status = status
-      console.log(`📝 已更新本地礼品卡状态: ${gift_card_number.substring(0, 4)}**** -> ${status}`)
-    }
-
-    // 显示状态更新通知
-    const notificationType = status === '有额度' ? 'success' : 'warning'
-    ElNotification({
-      title: '礼品卡状态更新',
-      message: `${gift_card_number.substring(0, 4)}**** - ${message}`,
-      type: notificationType,
-      duration: 5000
-    })
-
-    // 如果当前在礼品卡管理页面，刷新列表
-    if (activeTab.value === 'gift-cards') {
-      loadGiftCards()
-    }
-
-    console.log(`✅ 礼品卡状态更新已处理: ${gift_card_number.substring(0, 4)}**** -> ${status}`)
-  } catch (error) {
-    console.error('处理礼品卡状态更新错误:', error)
   }
 }
 
