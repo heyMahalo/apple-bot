@@ -871,7 +871,7 @@
             <el-option
               v-for="card in giftCards"
               :key="card.id"
-              :label="`${card.number} (余额: $${card.balance})`"
+              :label="`${card.gift_card_number} (${card.status})`"
               :value="card.id"
             />
           </el-select>
@@ -1145,42 +1145,74 @@
           <p><strong>任务名称：</strong>{{ waitingGiftCardTask.config?.name }}</p>
           <p><strong>当前状态：</strong>等待输入礼品卡</p>
 
-          <el-divider></el-divider>
+          <el-divider />
 
-          <h4>礼品卡信息</h4>
-          <el-form :model="taskGiftCardForm" label-width="120px" ref="giftCardFormRef">
-            <el-form-item
-              label="礼品卡号码"
-              required
-              :rules="[
-                { required: true, message: '请输入礼品卡号码', trigger: 'blur' },
-                { pattern: /^[A-Z0-9]{16}$/, message: '礼品卡号码必须是16位字母数字组合', trigger: 'blur' }
-              ]"
-              prop="code"
+          <h4>礼品卡信息 (最多8张)</h4>
+
+          <!-- 礼品卡输入列表 -->
+          <div v-for="(card, index) in taskGiftCardForm.cards" :key="index" style="margin-bottom: 20px; padding: 15px; border: 1px solid #e4e7ed; border-radius: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <h5 style="margin: 0; color: #409eff;">礼品卡 {{ index + 1 }}</h5>
+              <el-button
+                v-if="taskGiftCardForm.cards.length > 1"
+                type="danger"
+                size="small"
+                @click="removeTaskGiftCard(index)"
+                plain
+              >
+                删除
+              </el-button>
+            </div>
+
+            <el-form :model="card" label-width="120px" :ref="`giftCardForm${index}`">
+              <el-form-item
+                label="礼品卡号码"
+                required
+                :rules="[
+                  { required: true, message: '请输入礼品卡号码', trigger: 'blur' },
+                  { pattern: /^[A-Z0-9]{16}$/, message: '礼品卡号码必须是16位字母数字组合', trigger: 'blur' }
+                ]"
+                prop="code"
+              >
+                <el-input
+                  v-model="card.code"
+                  placeholder="请输入16位礼品卡号码（如：X7YVTGTLVR8FJ54Z）"
+                  maxlength="16"
+                  show-word-limit
+                  @input="formatGiftCardCode(index, $event)"
+                  style="text-transform: uppercase;"
+                />
+                <div class="form-help-text">
+                  <small>格式：16位字母数字组合，自动转换为大写</small>
+                </div>
+              </el-form-item>
+              <el-form-item label="备注">
+                <el-input
+                  v-model="card.note"
+                  type="textarea"
+                  placeholder="可选备注信息"
+                  :rows="2"
+                  maxlength="100"
+                  show-word-limit
+                />
+              </el-form-item>
+            </el-form>
+          </div>
+
+          <!-- 添加礼品卡按钮 -->
+          <div style="text-align: center; margin-top: 15px;">
+            <el-button
+              v-if="taskGiftCardForm.cards.length < 8"
+              type="primary"
+              @click="addTaskGiftCard"
+              plain
             >
-              <el-input
-                v-model="taskGiftCardForm.code"
-                placeholder="请输入16位礼品卡号码（如：X7YVTGTLVR8FJ54Z）"
-                maxlength="16"
-                show-word-limit
-                @input="formatGiftCardCode"
-                style="text-transform: uppercase;"
-              />
-              <div class="form-help-text">
-                <small>格式：16位字母数字组合，自动转换为大写</small>
-              </div>
-            </el-form-item>
-            <el-form-item label="备注">
-              <el-input
-                v-model="taskGiftCardForm.note"
-                type="textarea"
-                placeholder="可选备注信息"
-                :rows="2"
-                maxlength="100"
-                show-word-limit
-              />
-            </el-form-item>
-          </el-form>
+              + 添加礼品卡 ({{ taskGiftCardForm.cards.length }}/8)
+            </el-button>
+            <div v-else style="color: #909399; font-size: 14px;">
+              已达到最大数量限制 (8张)
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1226,8 +1258,12 @@ const showAddGiftCardDialog = ref(false)
 const showGiftCardInputDialog = ref(false)
 const waitingGiftCardTask = ref(null)
 const taskGiftCardForm = ref({
-  code: '',
-  note: ''
+  cards: [
+    {
+      code: '',
+      note: ''
+    }
+  ]
 })
 const selectedTask = ref(null)
 const autoScrollLogs = ref(true)
@@ -1563,6 +1599,12 @@ const initWebSocket = () => {
     socket.value.on('gift_card_input_required', (data) => {
       console.log('🎁 收到礼品卡输入请求:', data)
       handleGiftCardInputRequired(data)
+    })
+
+    // 礼品卡状态更新事件
+    socket.value.on('gift_card_status_update', (data) => {
+      console.log('🎁 收到礼品卡状态更新:', data)
+      handleGiftCardStatusUpdate(data)
     })
 
     // 任务日志事件
@@ -2121,7 +2163,7 @@ const getTasksByProduct = (productType) => {
 
   console.log(`🔍 筛选 ${productType} 任务，总任务数:`, tasks.value.length)
 
-  // 🚀 只显示待运行和正在运行的任务
+  // 🚀 只显示活跃任务，但不包括失败和完成的任务（避免闪烁）
   const activeStatuses = ['pending', 'running', 'stage_1_product_config', 'stage_2_account_login', 'stage_3_address_phone', 'stage_4_gift_card', 'waiting_gift_card_input']
 
   const filteredTasks = tasks.value.filter(task => {
@@ -2888,16 +2930,20 @@ const openGiftCardInput = (task) => {
   waitingGiftCardTask.value = task
   // 重置表单
   taskGiftCardForm.value = {
-    code: '',
-    note: ''
+    cards: [
+      {
+        code: '',
+        note: ''
+      }
+    ]
   }
   showGiftCardInputDialog.value = true
 }
 
 // 格式化礼品卡号码
-const formatGiftCardCode = () => {
+const formatGiftCardCode = (index, value) => {
   // 转换为大写并移除非字母数字字符
-  taskGiftCardForm.value.code = taskGiftCardForm.value.code
+  taskGiftCardForm.value.cards[index].code = value
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
     .substring(0, 16) // 限制最大长度为16
@@ -2907,31 +2953,65 @@ const cancelGiftCardInput = () => {
   showGiftCardInputDialog.value = false
   waitingGiftCardTask.value = null
   taskGiftCardForm.value = {
-    code: '',
-    note: ''
+    cards: [
+      {
+        code: '',
+        note: ''
+      }
+    ]
+  }
+}
+
+// 添加任务礼品卡
+const addTaskGiftCard = () => {
+  if (taskGiftCardForm.value.cards.length < 8) {
+    taskGiftCardForm.value.cards.push({
+      code: '',
+      note: ''
+    })
+    ElMessage.success(`已添加第${taskGiftCardForm.value.cards.length}张礼品卡`)
+  } else {
+    ElMessage.warning('最多只能添加8张礼品卡')
+  }
+}
+
+// 删除任务礼品卡
+const removeTaskGiftCard = (index) => {
+  if (taskGiftCardForm.value.cards.length > 1 && index >= 0 && index < taskGiftCardForm.value.cards.length) {
+    taskGiftCardForm.value.cards.splice(index, 1)
+    ElMessage.info(`已移除第${index + 1}张礼品卡`)
   }
 }
 
 const submitGiftCardInput = async () => {
-  if (!waitingGiftCardTask.value || !taskGiftCardForm.value.code) {
-    ElMessage.error('请输入礼品卡号码')
+  if (!waitingGiftCardTask.value) {
+    ElMessage.error('没有等待输入的任务')
+    return
+  }
+
+  // 验证至少有一张有效的礼品卡
+  const validCards = taskGiftCardForm.value.cards.filter(card => card.code && card.code.trim().length === 16)
+  if (validCards.length === 0) {
+    ElMessage.error('请至少输入一张有效的礼品卡号码')
     return
   }
 
   try {
     console.log('🎁 提交礼品卡信息:', {
       taskId: waitingGiftCardTask.value.id,
-      giftCard: taskGiftCardForm.value
+      cards: validCards
     })
 
-    // 发送礼品卡信息到后端
+    // 发送礼品卡信息到后端（新格式支持多张卡）
     const response = await axios.post(`http://localhost:5001/api/tasks/${waitingGiftCardTask.value.id}/gift-card`, {
-      code: taskGiftCardForm.value.code.toUpperCase(),
-      note: taskGiftCardForm.value.note
+      cards: validCards.map(card => ({
+        code: card.code.toUpperCase(),
+        note: card.note
+      }))
     })
 
     if (response.data.success) {
-      ElMessage.success('礼品卡信息已提交，任务继续执行')
+      ElMessage.success(`${validCards.length}张礼品卡信息已提交，任务继续执行`)
 
       // 更新任务状态
       const task = tasks.value.find(t => t.id === waitingGiftCardTask.value.id)
@@ -3360,6 +3440,45 @@ const handleGiftCardInputRequired = (data) => {
     }
   } catch (error) {
     console.error('处理礼品卡输入请求错误:', error)
+  }
+}
+
+// 处理礼品卡状态更新
+const handleGiftCardStatusUpdate = (data) => {
+  try {
+    console.log('🎁 处理礼品卡状态更新:', data)
+
+    const { gift_card_number, status, message } = data
+
+    if (!gift_card_number || !status) {
+      console.warn('⚠️ 无效的礼品卡状态更新数据')
+      return
+    }
+
+    // 更新本地礼品卡列表中的状态
+    const giftCard = giftCards.value.find(card => card.gift_card_number === gift_card_number)
+    if (giftCard) {
+      giftCard.status = status
+      console.log(`📝 已更新本地礼品卡状态: ${gift_card_number.substring(0, 4)}**** -> ${status}`)
+    }
+
+    // 显示状态更新通知
+    const notificationType = status === '有额度' ? 'success' : 'warning'
+    ElNotification({
+      title: '礼品卡状态更新',
+      message: `${gift_card_number.substring(0, 4)}**** - ${message}`,
+      type: notificationType,
+      duration: 5000
+    })
+
+    // 如果当前在礼品卡管理页面，刷新列表
+    if (activeTab.value === 'gift-cards') {
+      loadGiftCards()
+    }
+
+    console.log(`✅ 礼品卡状态更新已处理: ${gift_card_number.substring(0, 4)}**** -> ${status}`)
+  } catch (error) {
+    console.error('处理礼品卡状态更新错误:', error)
   }
 }
 

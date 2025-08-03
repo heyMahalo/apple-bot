@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>测试多张礼品卡功能</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+            background: #f9f9f9;
+        }
+        .card h3 {
+            margin-top: 0;
+            color: #409eff;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 8px;
+            margin: 5px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background: #409eff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #66b1ff;
+        }
+        button.danger {
+            background: #f56c6c;
+        }
+        button.danger:hover {
+            background: #f78989;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+            background: #f0f9ff;
+            border: 1px solid #b3d8ff;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎁 多张礼品卡功能测试</h1>
+    
+    <div id="gift-cards-container">
+        <!-- 礼品卡将在这里动态生成 -->
+    </div>
+    
+    <div style="text-align: center; margin: 20px 0;">
+        <button onclick="addGiftCard()">+ 添加礼品卡</button>
+        <button onclick="submitGiftCards()">提交所有礼品卡</button>
+        <button onclick="clearAll()" class="danger">清空所有</button>
+    </div>
+    
+    <div id="result" class="result" style="display: none;">
+        <h3>提交结果：</h3>
+        <pre id="result-content"></pre>
+    </div>
+
+    <script>
+        let giftCards = [
+            { code: '', note: '' }
+        ];
+
+        function renderGiftCards() {
+            const container = document.getElementById('gift-cards-container');
+            container.innerHTML = '';
+
+            giftCards.forEach((card, index) => {
+                const cardDiv = document.createElement('div');
+                cardDiv.className = 'card';
+                cardDiv.innerHTML = `
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <h3>礼品卡 ${index + 1}</h3>
+                        ${giftCards.length > 1 ? `<button onclick="removeGiftCard(${index})" class="danger">删除</button>` : ''}
+                    </div>
+                    <div>
+                        <label>礼品卡号码 (16位字母数字):</label>
+                        <input 
+                            type="text" 
+                            value="${card.code}" 
+                            onchange="updateGiftCard(${index}, 'code', this.value)"
+                            placeholder="如：X7YVTGTLVR8FJ54Z"
+                            maxlength="16"
+                            style="text-transform: uppercase;"
+                        />
+                    </div>
+                    <div>
+                        <label>备注:</label>
+                        <textarea 
+                            onchange="updateGiftCard(${index}, 'note', this.value)"
+                            placeholder="可选备注信息"
+                            rows="2"
+                        >${card.note}</textarea>
+                    </div>
+                `;
+                container.appendChild(cardDiv);
+            });
+
+            // 更新添加按钮状态
+            const addButton = document.querySelector('button[onclick="addGiftCard()"]');
+            if (giftCards.length >= 8) {
+                addButton.textContent = '已达到最大数量 (8张)';
+                addButton.disabled = true;
+            } else {
+                addButton.textContent = `+ 添加礼品卡 (${giftCards.length}/8)`;
+                addButton.disabled = false;
+            }
+        }
+
+        function addGiftCard() {
+            if (giftCards.length < 8) {
+                giftCards.push({ code: '', note: '' });
+                renderGiftCards();
+            }
+        }
+
+        function removeGiftCard(index) {
+            if (giftCards.length > 1) {
+                giftCards.splice(index, 1);
+                renderGiftCards();
+            }
+        }
+
+        function updateGiftCard(index, field, value) {
+            if (field === 'code') {
+                // 格式化礼品卡号码
+                value = value.toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 16);
+            }
+            giftCards[index][field] = value;
+        }
+
+        function clearAll() {
+            giftCards = [{ code: '', note: '' }];
+            renderGiftCards();
+            document.getElementById('result').style.display = 'none';
+        }
+
+        async function submitGiftCards() {
+            // 验证礼品卡
+            const validCards = giftCards.filter(card => 
+                card.code && card.code.trim().length === 16
+            );
+
+            if (validCards.length === 0) {
+                alert('请至少输入一张有效的礼品卡号码');
+                return;
+            }
+
+            // 显示提交的数据
+            const resultDiv = document.getElementById('result');
+            const resultContent = document.getElementById('result-content');
+            
+            const submitData = {
+                cards: validCards.map(card => ({
+                    code: card.code.toUpperCase(),
+                    note: card.note
+                }))
+            };
+
+            resultContent.textContent = JSON.stringify(submitData, null, 2);
+            resultDiv.style.display = 'block';
+
+            // 这里可以添加实际的API调用
+            console.log('提交的礼品卡数据:', submitData);
+            
+            // 模拟API调用
+            try {
+                const response = await fetch('http://localhost:5001/api/tasks/test-task-id/gift-card', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(submitData)
+                });
+                
+                const result = await response.json();
+                resultContent.textContent = `提交结果:\n${JSON.stringify(result, null, 2)}`;
+            } catch (error) {
+                resultContent.textContent = `提交错误:\n${error.message}`;
+            }
+        }
+
+        // 初始化
+        renderGiftCards();
+    </script>
+</body>
+</html>

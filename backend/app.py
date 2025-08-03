@@ -194,28 +194,48 @@ def create_app(config_name='default'):
         """创建新任务"""
         try:
             data = request.get_json()
-            
+
             from models.task import TaskConfig, ProductConfig, AccountConfig, GiftCard
 
-            # 解析产品配置
-            product_config_data = data.get('product_config', {})
-            product_config = ProductConfig(
-                model=product_config_data.get('model', ''),
-                finish=product_config_data.get('finish', ''),
-                storage=product_config_data.get('storage', ''),
-                trade_in=product_config_data.get('trade_in', 'No trade-in'),
-                payment=product_config_data.get('payment', 'Buy'),
-                apple_care=product_config_data.get('apple_care', 'No AppleCare+ Coverage')
-            )
+            # 检查是否是测试购买任务
+            task_type = data.get('type', 'normal')
+
+            if task_type == 'test_purchase':
+                # 测试购买任务的简化配置
+                product_config = ProductConfig(
+                    model='test-product',
+                    finish='default',
+                    storage='default',
+                    trade_in='No trade-in',
+                    payment='Buy',
+                    apple_care='No AppleCare+ Coverage'
+                )
+            else:
+                # 正常任务的产品配置
+                product_config_data = data.get('product_config', {})
+                product_config = ProductConfig(
+                    model=product_config_data.get('model', ''),
+                    finish=product_config_data.get('finish', ''),
+                    storage=product_config_data.get('storage', ''),
+                    trade_in=product_config_data.get('trade_in', 'No trade-in'),
+                    payment=product_config_data.get('payment', 'Buy'),
+                    apple_care=product_config_data.get('apple_care', 'No AppleCare+ Coverage')
+                )
 
             # 解析账号配置
-            account_config_data = data.get('account_config', {})
-            logger.info(f"🔍 调试 - 接收到的account_config_data: {account_config_data}")
-
-            # 获取Apple ID信息
-            apple_email = account_config_data.get('email', '')
-            apple_password = account_config_data.get('password', '')
-            logger.info(f"🔍 调试 - 从前端获取: email='{apple_email}', password='{apple_password}'")
+            if task_type == 'test_purchase':
+                # 测试任务直接从根级别获取账号信息
+                apple_email = data.get('account_email', '')
+                apple_password = data.get('account_password', '')
+                account_config_data = data.get('account_config', {})  # 也获取account_config以备后用
+                logger.info(f"🧪 测试任务账号信息: email='{apple_email}', password='{apple_password}'")
+            else:
+                # 正常任务从account_config获取
+                account_config_data = data.get('account_config', {})
+                logger.info(f"🔍 调试 - 接收到的account_config_data: {account_config_data}")
+                apple_email = account_config_data.get('email', '')
+                apple_password = account_config_data.get('password', '')
+                logger.info(f"🔍 调试 - 从前端获取: email='{apple_email}', password='{apple_password}'")
 
             # 从数据库获取对应账号的完整信息（包括电话号码）
             phone_number = account_config_data.get('phone_number', '07700900000')  # 默认英国手机号码
@@ -325,7 +345,26 @@ def create_app(config_name='default'):
                     'message': 'Failed to start task'
                 })
             return jsonify({'error': 'Failed to start task'}), 400
-    
+
+    @app.route('/api/tasks/<task_id>/execute', methods=['POST'])
+    def execute_task(task_id):
+        """执行任务（用于测试购买流程）"""
+        try:
+            task = task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
+
+            # 启动任务执行
+            success = task_manager.start_task(task_id, websocket_handler)
+            if success:
+                return jsonify({'success': True, 'message': '任务执行已启动'})
+            else:
+                return jsonify({'error': '任务执行失败'}), 400
+
+        except Exception as e:
+            logger.error(f"执行任务失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
     @app.route('/api/tasks/<task_id>/cancel', methods=['POST'])
     def cancel_task(task_id):
         """取消任务"""
@@ -348,23 +387,64 @@ def create_app(config_name='default'):
                 })
             return jsonify({'error': 'Failed to cancel task'}), 400
 
+    @app.route('/api/tasks/<task_id>/stop', methods=['POST'])
+    def stop_task(task_id):
+        """停止任务"""
+        try:
+            success = task_manager.cancel_task(task_id)
+            if success:
+                return jsonify({'success': True, 'message': '任务已停止'})
+            else:
+                return jsonify({'error': '停止任务失败'}), 400
+
+        except Exception as e:
+            logger.error(f"停止任务失败: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
     @app.route('/api/tasks/<task_id>/gift-card', methods=['POST'])
     def submit_gift_card(task_id):
-        """提交任务的礼品卡信息"""
+        """提交任务的礼品卡信息（支持多张）"""
         try:
             data = request.get_json()
-            code = data.get('code', '').strip().upper()  # 转换为大写
-            note = data.get('note', '').strip()
 
-            if not code:
-                return jsonify({'error': '礼品卡号码不能为空'}), 400
+            # 支持两种格式：单张卡（向后兼容）和多张卡
+            if 'code' in data:
+                # 单张卡格式（向后兼容）
+                cards = [{
+                    'code': data.get('code', '').strip().upper(),
+                    'note': data.get('note', '').strip()
+                }]
+            elif 'cards' in data:
+                # 多张卡格式
+                cards = data.get('cards', [])
+            else:
+                return jsonify({'error': '请提供礼品卡信息'}), 400
 
-            # 验证礼品卡号码格式（16位字母数字组合）
+            if not cards:
+                return jsonify({'error': '礼品卡信息不能为空'}), 400
+
+            # 验证每张礼品卡
             import re
-            if not re.match(r'^[A-Z0-9]{16}$', code):
-                return jsonify({'error': '礼品卡号码格式错误，应为16位字母数字组合'}), 400
+            valid_cards = []
+            for i, card in enumerate(cards):
+                code = card.get('code', '').strip().upper()
+                note = card.get('note', '').strip()
 
-            logger.info(f"🎁 收到任务 {task_id} 的礼品卡信息: {code[:4]}****")
+                if not code:
+                    continue  # 跳过空的礼品卡
+
+                if not re.match(r'^[A-Z0-9]{16}$', code):
+                    return jsonify({'error': f'第{i+1}张礼品卡号码格式错误，应为16位字母数字组合'}), 400
+
+                valid_cards.append({
+                    'code': code,
+                    'note': note
+                })
+
+            if not valid_cards:
+                return jsonify({'error': '没有有效的礼品卡'}), 400
+
+            logger.info(f"🎁 收到任务 {task_id} 的 {len(valid_cards)} 张礼品卡信息")
 
             # 获取任务
             task = task_manager.get_task(task_id)
@@ -376,18 +456,23 @@ def create_app(config_name='default'):
 
             # 更新任务的礼品卡信息
             from models.task import GiftCard
-            gift_card = GiftCard(number=code)
 
-            # 如果任务配置中没有礼品卡，添加一个
+            # 如果任务配置中没有礼品卡，初始化为空列表
             if not task.config.gift_cards:
                 task.config.gift_cards = []
 
-            # 添加新的礼品卡或更新现有的
-            task.config.gift_cards.append(gift_card)
-            task.config.gift_card_code = code  # 向后兼容
+            # 添加所有有效的礼品卡
+            for card_data in valid_cards:
+                gift_card = GiftCard(number=card_data['code'])
+                task.config.gift_cards.append(gift_card)
+                task.add_log(f"🎁 收到礼品卡信息: {card_data['code'][:4]}****", "info")
 
-            # 添加日志
-            task.add_log(f"🎁 收到礼品卡信息: {code[:4]}****", "info")
+            # 向后兼容：设置第一张卡为主卡
+            if valid_cards:
+                task.config.gift_card_code = valid_cards[0]['code']
+
+            # 添加总结日志
+            task.add_log(f"🎯 总共收到 {len(valid_cards)} 张礼品卡，准备应用", "info")
 
             # 更新任务状态为继续执行
             task.status = TaskStatus.STAGE_4_GIFT_CARD

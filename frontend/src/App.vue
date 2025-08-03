@@ -109,6 +109,9 @@
             <el-menu-item index="ip-pool">
               <span>🌐 IP池管理</span>
             </el-menu-item>
+            <el-menu-item index="test-purchase">
+              <span>🧪 购买测试</span>
+            </el-menu-item>
           </el-menu>
         </el-aside>
 
@@ -205,8 +208,22 @@
                     :format="(percentage) => getProgressText(task, percentage)"
                   />
 
+                  <!-- 醒目的礼品卡状态显示 -->
+                  <div v-if="getGiftCardStatus(task)" class="gift-card-status-banner" :class="getGiftCardStatus(task).type">
+                    <div class="status-icon">
+                      <span v-if="getGiftCardStatus(task).type === 'success'">✅</span>
+                      <span v-else-if="getGiftCardStatus(task).type === 'error'">❌</span>
+                      <span v-else-if="getGiftCardStatus(task).type === 'insufficient'">⚠️</span>
+                      <span v-else>🎁</span>
+                    </div>
+                    <div class="status-content">
+                      <div class="status-title">{{ getGiftCardStatus(task).title }}</div>
+                      <div class="status-message">{{ getGiftCardStatus(task).message }}</div>
+                    </div>
+                  </div>
+
                   <!-- 等待礼品卡输入提示 -->
-                  <div v-if="task.status === 'waiting_gift_card_input'" class="gift-card-waiting">
+                  <div v-if="task.status === 'waiting_gift_card_input' && !getGiftCardStatus(task)" class="gift-card-waiting">
                     <el-alert
                       title="等待礼品卡输入"
                       type="warning"
@@ -375,7 +392,7 @@
                       </template>
                     </el-table-column>
 
-                    <el-table-column label="操作" width="250" fixed="right">
+                    <el-table-column label="操作" width="450" fixed="right">
                       <template #default="scope">
                         <!-- 🎁 等待礼品卡输入状态的特殊操作 -->
                         <el-button
@@ -386,6 +403,39 @@
                         >
                           填写卡号
                         </el-button>
+
+                        <!-- 📋 已完成任务的订单操作 -->
+                        <template v-if="isTaskCompleted(scope.row) && extractOrderLink(scope.row)">
+                          <!-- 订单号显示 -->
+                          <el-tag
+                            v-if="extractOrderNumber(scope.row)"
+                            type="success"
+                            size="small"
+                            style="margin-right: 5px;"
+                          >
+                            {{ extractOrderNumber(scope.row) }}
+                          </el-tag>
+
+                          <!-- 查看订单按钮 -->
+                          <el-button
+                            type="success"
+                            size="small"
+                            @click.stop="openOrderLink(scope.row)"
+                            style="margin-right: 5px;"
+                          >
+                            查看订单
+                          </el-button>
+
+                          <!-- 复制链接按钮 -->
+                          <el-button
+                            type="primary"
+                            size="small"
+                            @click.stop="copyToClipboard(extractOrderLink(scope.row))"
+                            style="margin-right: 5px;"
+                          >
+                            复制链接
+                          </el-button>
+                        </template>
 
                         <el-button
                           type="text"
@@ -569,7 +619,7 @@
                     {{ formatTime(scope.row.created_at) }}
                   </template>
                 </el-table-column>
-                <el-table-column label="操作" width="200">
+                <el-table-column label="操作" width="450">
                   <template #default="scope">
                     <!-- 等待礼品卡输入状态的特殊操作 -->
                     <el-button
@@ -580,6 +630,39 @@
                     >
                       填写卡号
                     </el-button>
+
+                    <!-- 📋 已完成任务的订单操作 -->
+                    <template v-if="isTaskCompleted(scope.row) && extractOrderLink(scope.row)">
+                      <!-- 订单号显示 -->
+                      <el-tag
+                        v-if="extractOrderNumber(scope.row)"
+                        type="success"
+                        size="small"
+                        style="margin-right: 5px;"
+                      >
+                        {{ extractOrderNumber(scope.row) }}
+                      </el-tag>
+
+                      <!-- 查看订单按钮 -->
+                      <el-button
+                        type="success"
+                        size="small"
+                        @click="openOrderLink(scope.row)"
+                        style="margin-right: 5px;"
+                      >
+                        查看订单
+                      </el-button>
+
+                      <!-- 复制链接按钮 -->
+                      <el-button
+                        type="primary"
+                        size="small"
+                        @click="copyToClipboard(extractOrderLink(scope.row))"
+                        style="margin-right: 5px;"
+                      >
+                        复制链接
+                      </el-button>
+                    </template>
 
                     <!-- 其他状态的通用操作 -->
                     <el-button
@@ -735,6 +818,11 @@
               <el-button type="primary">添加代理</el-button>
             </div>
             <el-empty description="暂无代理" :image-size="100" />
+          </div>
+
+          <!-- 购买测试页面 -->
+          <div v-else-if="currentProduct === 'test-purchase'" class="product-section">
+            <TestPurchase />
           </div>
         </el-main>
       </el-container>
@@ -1147,40 +1235,116 @@
 
           <el-divider />
 
-          <h4>礼品卡信息</h4>
-          <el-form :model="taskGiftCardForm" label-width="120px" ref="giftCardFormRef">
-            <el-form-item
-              label="礼品卡号码"
-              required
-              :rules="[
-                { required: true, message: '请输入礼品卡号码', trigger: 'blur' },
-                { pattern: /^[A-Z0-9]{16}$/, message: '礼品卡号码必须是16位字母数字组合', trigger: 'blur' }
-              ]"
-              prop="code"
+          <div class="gift-card-header">
+            <h4>礼品卡信息</h4>
+            <div class="card-counter">
+              <span>{{ taskGiftCardForm.cards.length }}/8 张礼品卡</span>
+              <el-button
+                v-if="taskGiftCardForm.cards.length < 8"
+                type="primary"
+                size="small"
+                @click="addTaskGiftCard"
+                plain
+              >
+                + 添加礼品卡
+              </el-button>
+            </div>
+          </div>
+
+          <!-- 礼品卡列表 -->
+          <div class="gift-cards-list">
+            <div
+              v-for="(card, index) in taskGiftCardForm.cards"
+              :key="index"
+              class="gift-card-item"
+              :class="{ 'has-error': !isCardValid(card) && card.code.length > 0 }"
             >
-              <el-input
-                v-model="taskGiftCardForm.code"
-                placeholder="请输入16位礼品卡号码（如：X7YVTGTLVR8FJ54Z）"
-                maxlength="16"
-                show-word-limit
-                @input="formatGiftCardCode"
-                style="text-transform: uppercase;"
-              />
-              <div class="form-help-text">
-                <small>格式：16位字母数字组合，自动转换为大写</small>
+              <div class="card-header">
+                <div class="card-title">
+                  <span class="card-number">礼品卡 {{ index + 1 }}</span>
+                  <el-tag
+                    v-if="isCardValid(card)"
+                    type="success"
+                    size="small"
+                  >
+                    有效
+                  </el-tag>
+                  <el-tag
+                    v-else-if="card.code.length > 0"
+                    type="danger"
+                    size="small"
+                  >
+                    无效
+                  </el-tag>
+                </div>
+                <el-button
+                  v-if="taskGiftCardForm.cards.length > 1"
+                  type="danger"
+                  size="small"
+                  @click="removeTaskGiftCard(index)"
+                  plain
+                >
+                  删除
+                </el-button>
               </div>
-            </el-form-item>
-            <el-form-item label="备注">
-              <el-input
-                v-model="taskGiftCardForm.note"
-                type="textarea"
-                placeholder="可选备注信息"
-                :rows="2"
-                maxlength="100"
-                show-word-limit
-              />
-            </el-form-item>
-          </el-form>
+
+              <div class="card-form">
+                <el-form-item
+                  :label="`礼品卡号码 ${index + 1}`"
+                  :prop="`cards.${index}.code`"
+                  :rules="[
+                    { required: true, message: '请输入礼品卡号码', trigger: 'blur' },
+                    { pattern: /^[A-Z0-9]{16}$/, message: '礼品卡号码必须是16位字母数字组合', trigger: 'blur' }
+                  ]"
+                >
+                  <el-input
+                    v-model="card.code"
+                    placeholder="请输入16位礼品卡号码（如：X7YVTGTLVR8FJ54Z）"
+                    maxlength="16"
+                    show-word-limit
+                    @input="formatGiftCardCode(index, $event)"
+                    style="text-transform: uppercase;"
+                    clearable
+                  />
+                  <div class="form-help-text">
+                    <small>格式：16位字母数字组合，自动转换为大写</small>
+                  </div>
+                </el-form-item>
+
+                <el-form-item :label="`备注 ${index + 1}`">
+                  <el-input
+                    v-model="card.note"
+                    type="textarea"
+                    placeholder="可选备注信息"
+                    :rows="2"
+                    maxlength="100"
+                    show-word-limit
+                  />
+                </el-form-item>
+              </div>
+            </div>
+          </div>
+
+          <!-- 批量操作 -->
+          <div class="batch-actions">
+            <el-button @click="clearAllCards" type="info" plain size="small">
+              清空所有
+            </el-button>
+            <el-button @click="fillSampleCards" type="warning" plain size="small">
+              填入示例数据
+            </el-button>
+          </div>
+
+          <!-- 提交统计 -->
+          <div class="submit-summary">
+            <el-alert
+              :title="`准备提交 ${getValidCardsCount()} 张有效礼品卡`"
+              :type="getValidCardsCount() > 0 ? 'success' : 'warning'"
+              :description="getValidCardsCount() === 0 ? '请至少输入一张有效的礼品卡' : `将按顺序应用这 ${getValidCardsCount()} 张礼品卡`"
+              show-icon
+              :closable="false"
+            />
+          </div>
         </div>
       </div>
 
@@ -1189,9 +1353,9 @@
         <el-button
           type="primary"
           @click="submitGiftCardInput"
-          :disabled="!taskGiftCardForm.code"
+          :disabled="getValidCardsCount() === 0"
         >
-          提交并继续任务
+          提交 {{ getValidCardsCount() }} 张礼品卡并继续任务
         </el-button>
       </template>
     </el-dialog>
@@ -1201,6 +1365,7 @@
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import TestPurchase from './TestPurchase.vue'
 import {
   Document,
   Clock,
@@ -1226,8 +1391,12 @@ const showAddGiftCardDialog = ref(false)
 const showGiftCardInputDialog = ref(false)
 const waitingGiftCardTask = ref(null)
 const taskGiftCardForm = ref({
-  code: '',
-  note: ''
+  cards: [
+    {
+      code: '',
+      note: ''
+    }
+  ]
 })
 const selectedTask = ref(null)
 const autoScrollLogs = ref(true)
@@ -1236,6 +1405,9 @@ const isRefreshing = ref(false)
 
 const isConnected = ref(false)
 const hasInitialLoad = ref(false) // 标记是否已经初始加载过
+
+// 礼品卡状态存储 - 按任务ID存储状态
+const taskGiftCardStatuses = ref({})
 
 // 🚀 防抖相关
 let updateTasksDebounceTimer = null
@@ -1569,6 +1741,50 @@ const initWebSocket = () => {
     socket.value.on('gift_card_status_update', (data) => {
       console.log('🎁 收到礼品卡状态更新:', data)
       handleGiftCardStatusUpdate(data)
+    })
+
+    // 余额不足事件
+    socket.value.on('insufficient_balance', (data) => {
+      console.log('⚠️ 收到余额不足事件:', data)
+      if (data.task_id) {
+        setGiftCardStatus(data.task_id, {
+          type: 'insufficient',
+          title: '礼品卡余额不足',
+          message: `还需要 ${data.currency}${data.remaining_amount}`
+        })
+      }
+    })
+
+    // 礼品卡错误事件
+    socket.value.on('gift_card_error', (data) => {
+      console.log('❌ 收到礼品卡错误事件:', data)
+      if (data.task_id) {
+        setGiftCardStatus(data.task_id, {
+          type: 'error',
+          title: '礼品卡错误',
+          message: data.error_message
+        })
+      }
+    })
+
+    // 礼品卡成功事件
+    socket.value.on('gift_card_success', (data) => {
+      console.log('✅ 收到礼品卡成功事件:', data)
+      if (data.task_id) {
+        setGiftCardStatus(data.task_id, {
+          type: 'success',
+          title: '礼品卡应用成功',
+          message: data.message
+        })
+
+        // 3秒后自动清除成功状态
+        setTimeout(() => {
+          if (taskGiftCardStatuses.value[data.task_id] &&
+              taskGiftCardStatuses.value[data.task_id].type === 'success') {
+            delete taskGiftCardStatuses.value[data.task_id]
+          }
+        }, 3000)
+      }
     })
 
     // 任务日志事件
@@ -2681,6 +2897,101 @@ const formatTime = (timestamp) => {
   return new Date(timestamp).toLocaleString('zh-CN')
 }
 
+// 从任务日志中提取订单链接
+const extractOrderLink = (task) => {
+  if (!task.logs || task.logs.length === 0) return null
+
+  // 查找包含订单链接的日志
+  for (const log of task.logs) {
+    const message = log.message || ''
+
+    // 查找订单链接模式：🔗 订单链接: https://www.apple.com/xc/uk/vieworder/...
+    const orderLinkMatch = message.match(/🔗 订单链接: (https:\/\/www\.apple\.com\/xc\/uk\/vieworder\/[^\s]+)/)
+    if (orderLinkMatch) {
+      return orderLinkMatch[1]
+    }
+
+    // 也查找完整购买流程消息中的链接：🎉 购买流程完成！订单链接: https://...
+    const completeLinkMatch = message.match(/🎉 购买流程完成！订单链接: (https:\/\/www\.apple\.com\/xc\/uk\/vieworder\/[^\s]+)/)
+    if (completeLinkMatch) {
+      return completeLinkMatch[1]
+    }
+
+    // 直接查找订单链接模式：https://www.apple.com/xc/uk/vieworder/...
+    const directLinkMatch = message.match(/https:\/\/www\.apple\.com\/xc\/uk\/vieworder\/[^\s]+/)
+    if (directLinkMatch) {
+      return directLinkMatch[0]
+    }
+  }
+
+  return null
+}
+
+// 从任务日志中提取订单号
+const extractOrderNumber = (task) => {
+  if (!task.logs || task.logs.length === 0) return null
+
+  // 查找包含订单号的日志
+  for (const log of task.logs) {
+    const message = log.message || ''
+
+    // 查找订单号模式：✅ 找到订单号: Order No. W1568561950
+    const orderNumberMatch = message.match(/✅ 找到订单号: Order No\. ([A-Z0-9]+)/)
+    if (orderNumberMatch) {
+      return orderNumberMatch[1]
+    }
+
+    // 也查找简单的订单号模式：Order No. W1568561950
+    const simpleOrderMatch = message.match(/Order No\. ([A-Z0-9]+)/)
+    if (simpleOrderMatch) {
+      return simpleOrderMatch[1]
+    }
+  }
+
+  return null
+}
+
+// 复制文本到剪贴板
+const copyToClipboard = async (text) => {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      ElMessage.success('订单链接已复制到剪贴板')
+    } else {
+      // 降级方案
+      const textArea = document.createElement('textarea')
+      textArea.value = text
+      textArea.style.position = 'fixed'
+      textArea.style.left = '-999999px'
+      textArea.style.top = '-999999px'
+      document.body.appendChild(textArea)
+      textArea.focus()
+      textArea.select()
+      document.execCommand('copy')
+      textArea.remove()
+      ElMessage.success('订单链接已复制到剪贴板')
+    }
+  } catch (err) {
+    console.error('复制失败:', err)
+    ElMessage.error('复制失败，请手动复制')
+  }
+}
+
+// 检查任务是否已完成
+const isTaskCompleted = (task) => {
+  return task.status === 'completed' || task.status === 'success'
+}
+
+// 打开订单链接
+const openOrderLink = (task) => {
+  const orderLink = extractOrderLink(task)
+  if (orderLink) {
+    window.open(orderLink, '_blank')
+  } else {
+    ElMessage.error('未找到订单链接')
+  }
+}
+
 const formatTimestamp = (timestamp) => {
   if (!timestamp) return 'N/A'
   return new Date(timestamp).toLocaleString('zh-CN', {
@@ -2791,6 +3102,16 @@ const getActiveTasks = () => {
   return tasks.value.filter(task => activeStatuses.includes(task.status))
 }
 
+// 获取任务的礼品卡状态
+const getGiftCardStatus = (task) => {
+  return taskGiftCardStatuses.value[task.id] || null
+}
+
+// 设置任务的礼品卡状态
+const setGiftCardStatus = (taskId, status) => {
+  taskGiftCardStatuses.value[taskId] = status
+}
+
 // 🚀 状态显示相关函数
 const getStatusTagType = (status) => {
   const statusTypes = {
@@ -2894,50 +3215,139 @@ const openGiftCardInput = (task) => {
   waitingGiftCardTask.value = task
   // 重置表单
   taskGiftCardForm.value = {
-    code: '',
-    note: ''
+    cards: [
+      {
+        code: '',
+        note: ''
+      }
+    ]
   }
   showGiftCardInputDialog.value = true
 }
 
 // 格式化礼品卡号码
-const formatGiftCardCode = () => {
+const formatGiftCardCode = (index, value) => {
   // 转换为大写并移除非字母数字字符
-  taskGiftCardForm.value.code = taskGiftCardForm.value.code
+  taskGiftCardForm.value.cards[index].code = value
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
     .substring(0, 16) // 限制最大长度为16
+}
+
+// 验证礼品卡是否有效
+const isCardValid = (card) => {
+  return card.code && card.code.length === 16 && /^[A-Z0-9]{16}$/.test(card.code)
+}
+
+// 获取有效礼品卡数量
+const getValidCardsCount = () => {
+  return taskGiftCardForm.value.cards.filter(card => isCardValid(card)).length
+}
+
+// 添加任务礼品卡
+const addTaskGiftCard = () => {
+  if (taskGiftCardForm.value.cards.length < 8) {
+    taskGiftCardForm.value.cards.push({
+      code: '',
+      note: ''
+    })
+    ElMessage.success(`已添加第 ${taskGiftCardForm.value.cards.length} 张礼品卡`)
+  } else {
+    ElMessage.warning('最多只能添加8张礼品卡')
+  }
+}
+
+// 删除任务礼品卡
+const removeTaskGiftCard = (index) => {
+  if (taskGiftCardForm.value.cards.length > 1 && index >= 0 && index < taskGiftCardForm.value.cards.length) {
+    taskGiftCardForm.value.cards.splice(index, 1)
+    ElMessage.info(`已删除第 ${index + 1} 张礼品卡`)
+  } else if (taskGiftCardForm.value.cards.length === 1) {
+    ElMessage.warning('至少需要保留一张礼品卡')
+  }
+}
+
+// 清空所有礼品卡
+const clearAllCards = () => {
+  ElMessageBox.confirm('确定要清空所有礼品卡吗？', '确认清空', {
+    confirmButtonText: '确定',
+    cancelButtonText: '取消',
+    type: 'warning'
+  }).then(() => {
+    taskGiftCardForm.value.cards = [{
+      code: '',
+      note: ''
+    }]
+    ElMessage.success('已清空所有礼品卡')
+  }).catch(() => {
+    // 用户取消
+  })
+}
+
+// 填入示例数据（用于测试）
+const fillSampleCards = () => {
+  ElMessageBox.confirm('确定要填入示例数据吗？这将覆盖现有数据。', '确认填入示例', {
+    confirmButtonText: '确定',
+    cancelButtonText: '取消',
+    type: 'info'
+  }).then(() => {
+    taskGiftCardForm.value.cards = [
+      { code: 'X7YVTGTLVR8FJ54Z', note: '示例礼品卡1' },
+      { code: 'A1B2C3D4E5F6G7H8', note: '示例礼品卡2' },
+      { code: 'Z9Y8X7W6V5U4T3S2', note: '示例礼品卡3' }
+    ]
+    ElMessage.success('已填入示例数据')
+  }).catch(() => {
+    // 用户取消
+  })
 }
 
 const cancelGiftCardInput = () => {
   showGiftCardInputDialog.value = false
   waitingGiftCardTask.value = null
   taskGiftCardForm.value = {
-    code: '',
-    note: ''
+    cards: [
+      {
+        code: '',
+        note: ''
+      }
+    ]
   }
 }
 
+
+
 const submitGiftCardInput = async () => {
-  if (!waitingGiftCardTask.value || !taskGiftCardForm.value.code) {
-    ElMessage.error('请输入礼品卡号码')
+  if (!waitingGiftCardTask.value) {
+    ElMessage.error('没有等待输入的任务')
+    return
+  }
+
+  // 获取所有有效的礼品卡
+  const validCards = taskGiftCardForm.value.cards.filter(card => isCardValid(card))
+
+  if (validCards.length === 0) {
+    ElMessage.error('请至少输入一张有效的礼品卡号码')
     return
   }
 
   try {
     console.log('🎁 提交礼品卡信息:', {
       taskId: waitingGiftCardTask.value.id,
-      giftCard: taskGiftCardForm.value
+      validCardsCount: validCards.length,
+      cards: validCards
     })
 
-    // 发送礼品卡信息到后端
+    // 发送礼品卡信息到后端（支持多张卡）
     const response = await axios.post(`http://localhost:5001/api/tasks/${waitingGiftCardTask.value.id}/gift-card`, {
-      code: taskGiftCardForm.value.code.toUpperCase(),
-      note: taskGiftCardForm.value.note
+      cards: validCards.map(card => ({
+        code: card.code.toUpperCase(),
+        note: card.note
+      }))
     })
 
     if (response.data.success) {
-      ElMessage.success('礼品卡信息已提交，任务继续执行')
+      ElMessage.success(`${validCards.length} 张礼品卡信息已提交，任务继续执行`)
 
       // 更新任务状态
       const task = tasks.value.find(t => t.id === waitingGiftCardTask.value.id)
@@ -3637,7 +4047,8 @@ const switchProduct = (productKey) => {
     'all-tasks': '所有任务',
     'accounts': '账号管理',
     'gift-cards': '礼品卡管理',
-    'ip-pool': 'IP池管理'
+    'ip-pool': 'IP池管理',
+    'test-purchase': '购买测试'
   }
 
   // 🚀 优化：只在真正需要时才加载数据，避免频繁刷新
@@ -3689,11 +4100,15 @@ onUnmounted(() => {
     socket.value.disconnect()
   }
 
-  // 🚀 清理智能轮询
-  stopSmartPolling()
-
+  // 清理定时器
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer)
+  }
+  if (smartPollingTimer) {
+    clearInterval(smartPollingTimer)
+  }
+  if (fullPollingTimer) {
+    clearInterval(fullPollingTimer)
   }
 })
 </script>
@@ -3711,35 +4126,60 @@ onUnmounted(() => {
 .header-left h2 {
   margin: 0;
   color: #2c3e50;
-  font-weight: 600;
 }
 
 .header-right {
   display: flex;
   align-items: center;
-  gap: 15px;
+  gap: 10px;
+}
+
+.status-indicators {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 15px;
+}
+
+.status-badge {
+  margin-left: 5px;
+}
+
+.sync-status, .polling-status, .active-tasks {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #f0f9ff;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #0369a1;
+}
+
+.sync-indicator, .polling-indicator, .active-indicator {
+  font-size: 10px;
 }
 
 .sidebar {
-  background: #fff;
+  background: #f8f9fa;
   border-right: 1px solid #e4e7ed;
 }
 
 .menu {
   border: none;
-  height: 100%;
+  background: transparent;
 }
 
 .main-content {
-  background: #f5f7fa;
   padding: 20px;
+  background: #f5f7fa;
 }
 
 .product-section {
-  background: #fff;
+  background: white;
   border-radius: 8px;
   padding: 20px;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
 .section-header {
@@ -3748,34 +4188,19 @@ onUnmounted(() => {
   align-items: center;
   margin-bottom: 20px;
   padding-bottom: 15px;
-  border-bottom: 2px solid #e4e7ed;
+  border-bottom: 1px solid #e4e7ed;
 }
 
 .section-header h2 {
   margin: 0;
   color: #2c3e50;
-  font-weight: 600;
-  font-size: 24px;
-}
-
-.header-actions {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.status-indicators {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-right: 15px;
 }
 
 .stats-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 20px;
-  margin-bottom: 30px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 15px;
+  margin-bottom: 20px;
 }
 
 .stat-card {
@@ -3787,31 +4212,31 @@ onUnmounted(() => {
 }
 
 .stat-number {
-  font-size: 32px;
+  font-size: 24px;
   font-weight: bold;
   color: #409eff;
   margin-bottom: 5px;
 }
 
 .stat-label {
-  color: #666;
   font-size: 14px;
+  color: #666;
 }
 
 .tasks-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
   gap: 20px;
-  margin-top: 20px;
 }
 
 .task-card {
   border-radius: 8px;
-  transition: transform 0.2s;
+  transition: all 0.3s ease;
 }
 
 .task-card:hover {
   transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
 }
 
 .card-header {
@@ -3827,15 +4252,8 @@ onUnmounted(() => {
 
 .task-details p {
   margin: 8px 0;
-  color: #666;
   font-size: 14px;
-}
-
-.task-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 15px;
-  flex-wrap: wrap;
+  color: #666;
 }
 
 .current-step {
@@ -3847,209 +4265,57 @@ onUnmounted(() => {
 }
 
 .latest-log {
-  margin: 10px 0;
+  margin-top: 10px;
   padding: 8px;
-  background: #f9f9f9;
+  background: #f8f9fa;
   border-radius: 4px;
   border-left: 3px solid #909399;
 }
 
 .log-text {
   margin: 0;
-  font-size: 12px;
-  color: #666;
+  font-size: 13px;
   line-height: 1.4;
 }
 
-/* 任务详情对话框样式 */
-.log-container {
-  max-height: 300px;
-  overflow-y: auto;
-  border: 1px solid #e4e7ed;
-  border-radius: 4px;
-  background: #fafafa;
-}
-
-.log-entries {
-  padding: 10px;
-}
-
-.log-entry {
-  display: flex;
-  margin-bottom: 8px;
-  padding: 6px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.log-entry.info {
-  background: #f0f9ff;
-  border-left: 3px solid #409eff;
-}
-
-.log-entry.success {
-  background: #f0f9f0;
-  border-left: 3px solid #67c23a;
-}
-
-.log-entry.warning {
-  background: #fdf6ec;
-  border-left: 3px solid #e6a23c;
-}
-
-.log-entry.error {
-  background: #fef0f0;
-  border-left: 3px solid #f56c6c;
-}
-
-.log-time {
-  color: #909399;
-  margin-right: 10px;
-  white-space: nowrap;
-  min-width: 120px;
-}
-
-.log-message {
-  color: #303133;
-  flex: 1;
-  word-break: break-word;
-}
-
-.no-logs {
-  padding: 20px;
-  text-align: center;
-  color: #909399;
-  font-style: italic;
-}
-
-/* 🚀 SOTA实时同步样式 */
-.gift-card-waiting {
-  margin: 10px 0;
-}
-
-.log-time {
-  margin: 0;
-  font-size: 10px;
-  color: #909399;
-  text-align: right;
-}
-
-.log-error {
-  color: #f56c6c;
-}
-
-.log-warning {
-  color: #e6a23c;
-}
-
-.log-success {
+.log-text.success {
   color: #67c23a;
+  border-left-color: #67c23a;
 }
 
-.log-info {
+.log-text.error {
+  color: #f56c6c;
+  border-left-color: #f56c6c;
+}
+
+.log-text.warning {
+  color: #e6a23c;
+  border-left-color: #e6a23c;
+}
+
+.log-text.info {
   color: #409eff;
+  border-left-color: #409eff;
 }
 
-/* 实时更新动画 */
-.task-card {
-  transition: all 0.3s ease;
+.log-time {
+  margin: 4px 0 0 0;
+  font-size: 11px;
+  color: #999;
 }
 
-.task-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-}
-
-/* 移除过度的动画效果，保持界面稳定 */
-.current-step {
-  background-color: #f0f9ff;
-  transition: background-color 0.3s ease;
-}
-
-/* 🚀 SOTA实时同步状态样式 */
-.sync-status {
+.task-actions {
   display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  background: linear-gradient(45deg, #67c23a, #85ce61);
-  border-radius: 12px;
-  color: white;
-  font-size: 12px;
-  font-weight: 500;
+  gap: 8px;
+  margin-top: 15px;
 }
 
-.sync-indicator {
-  animation: spin 3s linear infinite;
-}
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.sync-text {
-  white-space: nowrap;
-}
-
-.polling-status {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  background: linear-gradient(45deg, #409eff, #66b1ff);
-  border-radius: 12px;
-  color: white;
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.polling-indicator {
-  animation: pulse 2s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
-
-.polling-text {
-  white-space: nowrap;
-}
-
-.active-tasks {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  background: linear-gradient(45deg, #e6a23c, #f7ba2a);
-  border-radius: 12px;
-  color: white;
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.active-indicator {
-  animation: flash 1s ease-in-out infinite alternate;
-}
-
-@keyframes flash {
-  from { opacity: 1; }
-  to { opacity: 0.5; }
-}
-
-.active-text {
-  white-space: nowrap;
-}
-
-/* 🚀 任务列表页签样式 */
 .task-tabs {
   margin-top: 20px;
 }
 
-.task-list-content {
-  padding: 20px 0;
+.tab-content {
+  padding-top: 20px;
 }
 
 .search-filter-bar {
@@ -4061,31 +4327,8 @@ onUnmounted(() => {
 
 .filter-info {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 10px;
-}
-
-.task-name-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.task-name {
-  font-weight: 500;
-  color: #303133;
-}
-
-.task-id {
-  font-family: monospace;
-  font-size: 11px;
-  background: #f0f0f0;
-  color: #666;
-}
-
-.text-muted {
-  color: #909399;
+  align-items: center;
 }
 
 .task-row {
@@ -4096,84 +4339,237 @@ onUnmounted(() => {
   background-color: #f5f7fa;
 }
 
+.task-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-id {
+  font-family: monospace;
+  font-size: 11px;
+}
+
 .pagination-wrapper {
   margin-top: 20px;
+  text-align: center;
+}
+
+.log-container {
+  max-height: 300px;
+  overflow-y: auto;
+  background: #1a1a1a;
+  border-radius: 4px;
+  padding: 10px;
+}
+
+.log-entries {
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.log-entry {
+  display: flex;
+  margin-bottom: 4px;
+  color: #e0e0e0;
+}
+
+.log-entry.success {
+  color: #67c23a;
+}
+
+.log-entry.error {
+  color: #f56c6c;
+}
+
+.log-entry.warning {
+  color: #e6a23c;
+}
+
+.log-entry.info {
+  color: #409eff;
+}
+
+.log-time {
+  margin-right: 10px;
+  color: #999;
+  min-width: 80px;
+}
+
+.log-message {
+  flex: 1;
+}
+
+.no-logs {
+  text-align: center;
+  color: #999;
+  font-style: italic;
+  padding: 20px;
+}
+
+.gift-card-waiting {
+  margin: 10px 0;
+}
+
+.security-issue-details {
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.text-muted {
+  color: #999;
+}
+
+/* 多张礼品卡样式 */
+.gift-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e4e7ed;
+}
+
+.gift-card-header h4 {
+  margin: 0;
+  color: #303133;
+}
+
+.card-counter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-counter span {
+  color: #909399;
+  font-size: 14px;
+}
+
+.gift-cards-list {
+  max-height: 400px;
+  overflow-y: auto;
+  margin-bottom: 15px;
+}
+
+.gift-card-item {
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  padding: 15px;
+  margin-bottom: 15px;
+  background: #fafafa;
+  transition: all 0.3s ease;
+}
+
+.gift-card-item:hover {
+  border-color: #409eff;
+  box-shadow: 0 2px 8px rgba(64, 158, 255, 0.1);
+}
+
+.gift-card-item.has-error {
+  border-color: #f56c6c;
+  background: #fef0f0;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-number {
+  font-weight: 600;
+  color: #409eff;
+}
+
+.card-form {
+  background: white;
+  padding: 15px;
+  border-radius: 6px;
+  border: 1px solid #e4e7ed;
+}
+
+.batch-actions {
   display: flex;
   justify-content: center;
+  gap: 10px;
+  margin-bottom: 15px;
+  padding: 10px;
+  background: #f5f7fa;
+  border-radius: 6px;
 }
 
-/* 状态标签颜色 */
-.el-tag.el-tag--pending {
-  background-color: #f4f4f5;
-  color: #909399;
-  border-color: #e4e7ed;
-}
-
-.el-tag.el-tag--running {
-  background-color: #ecf5ff;
-  color: #409eff;
-  border-color: #b3d8ff;
-}
-
-.el-tag.el-tag--completed {
-  background-color: #f0f9ff;
-  color: #67c23a;
-  border-color: #c2e7b0;
-}
-
-.el-tag.el-tag--failed {
-  background-color: #fef0f0;
-  color: #f56c6c;
-  border-color: #fbc4c4;
-}
-
-.el-tag.el-tag--cancelled {
-  background-color: #fdf6ec;
-  color: #e6a23c;
-  border-color: #f5dab1;
-}
-
-/* 进度条样式 */
-.el-progress--line {
-  margin-bottom: 0;
-}
-
-.el-progress-bar__outer {
-  border-radius: 4px;
-}
-
-.el-progress-bar__inner {
-  border-radius: 4px;
-}
-
-/* 🚀 所有任务页签样式 */
-.tasks-table {
-  margin-top: 20px;
-}
-
-.progress-text {
-  font-size: 12px;
-  margin-left: 8px;
-  color: #666;
-}
-
-.task-count {
-  font-size: 12px;
-  opacity: 0.8;
-  margin-left: 4px;
-}
-
-/* 🎁 礼品卡输入表单样式 */
-.gift-card-form {
-  padding: 10px 0;
+.submit-summary {
+  margin-top: 15px;
 }
 
 .form-help-text {
-  margin-top: 4px;
-}
-
-.form-help-text small {
+  margin-top: 5px;
   color: #909399;
   font-size: 12px;
+}
+
+/* 醒目的礼品卡状态横幅 */
+.gift-card-status-banner {
+  display: flex;
+  align-items: center;
+  padding: 12px;
+  margin: 12px 0;
+  border-radius: 8px;
+  border-left: 4px solid;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+  animation: slideIn 0.3s ease-out;
+  font-size: 13px;
+}
+
+.gift-card-status-banner.success {
+  background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+  border-left-color: #28a745;
+  color: #155724;
+}
+
+.gift-card-status-banner.error {
+  background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
+  border-left-color: #dc3545;
+  color: #721c24;
+}
+
+.gift-card-status-banner.insufficient {
+  background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%);
+  border-left-color: #ffc107;
+  color: #856404;
+}
+
+.gift-card-status-banner .status-icon {
+  font-size: 18px;
+  margin-right: 12px;
+  flex-shrink: 0;
+}
+
+.gift-card-status-banner .status-content {
+  flex: 1;
+}
+
+.gift-card-status-banner .status-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.gift-card-status-banner .status-message {
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 </style>

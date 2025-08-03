@@ -363,7 +363,44 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"获取礼品卡失败: {str(e)}")
             return None
-    
+
+    def get_gift_card_by_number(self, gift_card_number: str) -> Optional[GiftCard]:
+        """根据礼品卡号码获取礼品卡"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM gift_cards WHERE gift_card_number = ?', (gift_card_number,))
+                row = cursor.fetchone()
+
+                return self._row_to_gift_card(row) if row else None
+
+        except Exception as e:
+            logger.error(f"根据号码获取礼品卡失败: {str(e)}")
+            return None
+
+    def update_gift_card_status(self, gift_card_number: str, status: str) -> bool:
+        """根据礼品卡号码更新状态"""
+        try:
+            # 验证状态
+            valid_statuses = [status.value for status in GiftCardStatus]
+            if status not in valid_statuses:
+                raise ValueError(f"无效的礼品卡状态: {status}")
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE gift_cards
+                    SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE gift_card_number = ?
+                ''', (status, gift_card_number))
+
+                conn.commit()
+                return cursor.rowcount > 0
+
+        except Exception as e:
+            logger.error(f"更新礼品卡状态失败: {str(e)}")
+            return False
+
     def update_gift_card(self, card_id: int, gift_card_number: str = None, status: str = None, notes: str = None) -> bool:
         """更新礼品卡"""
         try:

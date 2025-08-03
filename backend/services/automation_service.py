@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, Optional
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -14,8 +15,9 @@ class AutomationService:
     """基于apple_automator.py的自动化服务 - 完全重写版本"""
     
     def __init__(self, ip_service=None):
-        self.playwright = None
-        self.browser: Optional[Browser] = None
+        # 移除共享的playwright和browser实例，改为任务级别的实例
+        self.task_playwrights: Dict[str, any] = {}  # 每个任务的playwright实例
+        self.task_browsers: Dict[str, Browser] = {}  # 每个任务的browser实例
         self.contexts: Dict[str, BrowserContext] = {}
         self.pages: Dict[str, Page] = {}
         self.websocket_handler = None
@@ -28,7 +30,9 @@ class AutomationService:
         self.message_service = get_message_service()
         # 🚀 初始化SOTA消息服务
         self.sota_message_service = get_sota_message_service()
-        
+        # 线程本地存储，每个线程有自己的事件循环
+        self._thread_local = threading.local()
+
     def set_websocket_handler(self, handler):
         """设置WebSocket处理器用于实时反馈"""
         self.websocket_handler = handler
@@ -144,6 +148,32 @@ class AutomationService:
         except Exception as e:
             logger.error(f"❌ 发送日志失败: {e}")
 
+    def execute_task_threadsafe(self, task: Task) -> bool:
+        """线程安全的任务执行包装方法"""
+        try:
+            # 为当前线程创建新的事件循环
+            if not hasattr(self._thread_local, 'loop'):
+                self._thread_local.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._thread_local.loop)
+
+            loop = self._thread_local.loop
+
+            # 在线程专用的事件循环中执行任务
+            return loop.run_until_complete(self.execute_task(task))
+
+        except Exception as e:
+            logger.error(f"❌ 线程安全任务执行失败: {e}")
+            task.add_log(f"❌ 任务执行失败: {str(e)}", "error")
+            return False
+        finally:
+            # 清理资源
+            try:
+                if hasattr(self._thread_local, 'loop'):
+                    # 不关闭循环，保持复用
+                    pass
+            except Exception as e:
+                logger.error(f"❌ 清理事件循环失败: {e}")
+
     async def execute_task(self, task: Task) -> bool:
         """🚀 执行四阶段任务流程 - 主入口方法"""
         try:
@@ -168,6 +198,17 @@ class AutomationService:
             # 🎯 阶段4：礼品卡配置 - 这里会暂停等待用户输入
             if not await self._execute_stage_4_gift_card(task):
                 return False
+
+            # 🎯 阶段5：完成购买流程
+            stage5_result = await self._execute_stage_5_complete_purchase(task)
+            if not stage5_result:
+                # 检查是否是余额不足导致的等待状态
+                if task.status == TaskStatus.WAITING_GIFT_CARD_INPUT:
+                    # 余额不足，等待用户输入更多礼品卡
+                    self._send_log(task, "warning", "⏳ 余额不足，等待用户输入更多礼品卡...")
+                    return True  # 返回True表示任务暂停等待输入，而不是失败
+                else:
+                    return False
 
             self._send_log(task, "success", "✅ 任务执行完成")
             return True
@@ -194,17 +235,27 @@ class AutomationService:
                 self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "导航到产品页面失败")
                 return False
 
-            # 配置产品选项
-            if not await self.configure_product(task):
-                task.status = TaskStatus.FAILED
-                self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "产品配置失败")
-                return False
+            # 检查是否是测试产品
+            is_test_product = task.config.product_config.model == 'test-product'
 
-            # 添加到购物车
-            if not await self.add_to_bag(task):
-                task.status = TaskStatus.FAILED
-                self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "添加到购物车失败")
-                return False
+            if is_test_product:
+                # 测试产品：configure_product会处理完整流程（包括add_to_bag和checkout）
+                if not await self.configure_product(task):
+                    task.status = TaskStatus.FAILED
+                    self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "测试产品流程失败")
+                    return False
+            else:
+                # 正常产品：分别处理配置和添加到购物车
+                if not await self.configure_product(task):
+                    task.status = TaskStatus.FAILED
+                    self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "产品配置失败")
+                    return False
+
+                # 添加到购物车
+                if not await self.add_to_bag(task):
+                    task.status = TaskStatus.FAILED
+                    self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "failed", 25, "添加到购物车失败")
+                    return False
 
             self._send_step_update(task, TaskStep.STAGE_1_PRODUCT_CONFIG.value, "completed", 25, "✅ 产品配置阶段完成")
             self._send_log(task, "success", "🎉 阶段1：产品配置 - 成功完成")
@@ -227,6 +278,20 @@ class AutomationService:
             page = self.pages.get(task.id)
             if not page:
                 raise Exception("浏览器页面不可用")
+
+            # 检查当前页面状态，确认登录是否已完成
+            current_url = page.url
+            task.add_log(f"🔍 当前页面URL: {current_url}", "info")
+
+            # 如果当前在登录页面，需要执行登录
+            if "signin" in current_url.lower() or "login" in current_url.lower():
+                task.add_log("🔐 检测到登录页面，开始执行登录流程", "info")
+                # 继续执行登录逻辑
+            else:
+                task.add_log("✅ 已经登录，跳过登录流程", "info")
+                self._send_step_update(task, TaskStep.STAGE_2_ACCOUNT_LOGIN.value, "completed", 50, "✅ 登录已完成")
+                self._send_log(task, "success", "🎉 阶段2：账号登录 - 已完成")
+                return True
 
             # 检查当前页面状态，确认登录是否已完成
             current_url = page.url
@@ -260,6 +325,11 @@ class AutomationService:
     async def _execute_stage_3_address_phone(self, task: Task) -> bool:
         """阶段3：地址电话配置"""
         try:
+            # 防止重复执行
+            if hasattr(task, 'stage_3_completed') and task.stage_3_completed:
+                task.add_log("⚠️ 阶段3已经完成过，跳过重复执行", "warning")
+                return True
+
             # 🚀 更新任务状态为阶段3
             task.status = TaskStatus.STAGE_3_ADDRESS_PHONE
             self._send_step_update(task, TaskStep.STAGE_3_ADDRESS_PHONE.value, "started", 75, "开始地址电话配置阶段")
@@ -273,9 +343,17 @@ class AutomationService:
             account_config = task.config.account_config
             phone_number = account_config.phone_number if account_config else '07700900000'
 
+            # 检查是否是测试产品
+            is_test_product = task.config.product_config.model == 'test-product'
+
+            if is_test_product:
+                task.add_log("🧪 测试产品：处理Continue to Shipping Address和地址配置", "info")
+
             # 继续结账流程（包括地址和电话号码配置）
             await self._continue_checkout_flow(page, task, phone_number)
 
+            # 标记阶段3已完成
+            task.stage_3_completed = True
             self._send_step_update(task, TaskStep.STAGE_3_ADDRESS_PHONE.value, "completed", 75, "✅ 地址电话配置阶段完成")
             self._send_log(task, "success", "🎉 阶段3：地址电话配置 - 成功完成")
             return True
@@ -289,6 +367,11 @@ class AutomationService:
     async def _execute_stage_4_gift_card(self, task: Task) -> bool:
         """阶段4：礼品卡配置"""
         try:
+            # 防止重复执行
+            if hasattr(task, 'stage_4_completed') and task.stage_4_completed:
+                task.add_log("⚠️ 阶段4已经完成过，跳过重复执行", "warning")
+                return True
+
             # 🚀 更新任务状态为阶段4
             task.status = TaskStatus.STAGE_4_GIFT_CARD
             self._send_step_update(task, TaskStep.STAGE_4_GIFT_CARD.value, "started", 100, "开始礼品卡配置阶段")
@@ -299,18 +382,44 @@ class AutomationService:
                 raise Exception("浏览器页面不可用")
 
             # 检查是否已经有礼品卡信息（用户已经输入过）
+            task.add_log(f"🔍 检查礼品卡信息: gift_cards={bool(task.config.gift_cards)}, gift_card_code={bool(task.config.gift_card_code)}", "info")
+
             if task.config.gift_cards or task.config.gift_card_code:
                 task.add_log("🎁 检测到已有礼品卡信息，直接应用礼品卡", "info")
                 # 直接应用礼品卡，不再等待用户输入
-                await self._apply_existing_gift_cards(page, task)
+                # 持续尝试应用礼品卡，直到成功
+                while True:
+                    # 尝试应用现有礼品卡
+                    apply_result = await self._apply_existing_gift_cards(page, task)
+                    if apply_result:
+                        task.add_log("✅ 礼品卡应用完成", "success")
+                        # 标记礼品卡已经应用过，避免重复应用
+                        task.gift_cards_applied = True
+                        break
+                    else:
+                        # 如果礼品卡应用失败，需要等待用户输入新的礼品卡
+                        task.add_log("⏳ 礼品卡应用失败，等待用户输入新的礼品卡...", "warning")
+                        await self._handle_gift_card_input(page, task)
+                        # 重新尝试应用
+                        apply_result = await self._apply_submitted_gift_cards(page, task)
+                        if apply_result:
+                            task.gift_cards_applied = True
+                            break
+                        else:
+                            # 如果仍然失败，继续循环等待
+                            task.add_log("⏳ 礼品卡仍然失败，继续等待用户输入...", "warning")
             else:
                 task.add_log("🎁 没有礼品卡信息，等待用户输入", "info")
                 # 处理礼品卡输入（这里会暂停等待用户输入）
                 await self._handle_gift_card_input(page, task)
 
             # 如果到达这里，说明礼品卡处理完成
+            task.add_log("🔍 阶段4即将完成，准备进入阶段5", "info")
+            # 标记阶段4已完成
+            task.stage_4_completed = True
             self._send_step_update(task, TaskStep.STAGE_4_GIFT_CARD.value, "completed", 100, "✅ 礼品卡配置阶段完成")
             self._send_log(task, "success", "🎉 阶段4：礼品卡配置 - 成功完成")
+            task.add_log("✅ 阶段4返回True，应该进入阶段5", "info")
             return True
 
         except Exception as e:
@@ -319,19 +428,93 @@ class AutomationService:
             self._send_log(task, "error", f"❌ 阶段4失败: {str(e)}")
             return False
 
+    async def _execute_stage_5_complete_purchase(self, task: Task) -> bool:
+        """阶段5：完成购买流程"""
+        try:
+            task.add_log("🚀 进入阶段5：完成购买流程", "info")
+            # 🚀 更新任务状态为阶段5
+            task.status = TaskStatus.RUNNING  # 使用RUNNING状态，因为没有专门的阶段5状态
+            self._send_step_update(task, "stage_5_complete_purchase", "started", 100, "开始完成购买流程")
+
+            # 获取页面对象
+            page = self.pages.get(task.id)
+            if not page:
+                raise Exception("浏览器页面不可用")
+
+            task.add_log("🛒 开始最终购买流程...", "info")
+
+            # 1. 点击Review Your Order按钮
+            await self._click_review_your_order(page, task)
+
+            # 2. 检查当前页面状态
+            current_url = page.url
+            task.add_log(f"🔍 当前页面URL: {current_url}", "info")
+
+            if "checkout?_s=Review" in current_url:
+                # 如果已经在Review页面，说明礼品卡余额充足，直接继续
+                task.add_log("✅ 已在Review页面，说明礼品卡余额充足，继续购买流程", "success")
+            else:
+                # 如果不在Review页面，需要检查余额状态
+                task.add_log("🔍 不在Review页面，开始检查余额状态...", "info")
+
+                # 使用循环来处理余额不足的情况
+                attempt = 0
+                max_attempts = 10  # 设置最大尝试次数，避免无限循环
+
+                while attempt < max_attempts:
+                    attempt += 1
+                    task.add_log(f"🔍 第 {attempt} 次检查礼品卡余额...", "info")
+
+                    balance_check_result = await self._check_gift_card_balance_and_proceed(page, task)
+                    if balance_check_result:
+                        # 余额充足，继续后续流程
+                        task.add_log("✅ 礼品卡余额充足，继续购买流程", "success")
+                        break
+                    else:
+                        # 余额不足，等待用户输入更多礼品卡
+                        task.add_log(f"⚠️ 第 {attempt} 次余额检查不足，等待用户输入更多礼品卡", "warning")
+
+                        # 如果达到最大尝试次数，停止循环
+                        if attempt >= max_attempts:
+                            task.add_log("❌ 达到最大余额检查次数，停止检查", "error")
+                            return False
+
+            # 3. 处理Terms & Conditions
+            await self._handle_terms_and_conditions(page, task)
+
+            # 4. 点击Place your order按钮
+            await self._place_order(page, task)
+
+            # 5. 处理感谢页面并提取订单号
+            await self._handle_thank_you_page(page, task)
+
+            self._send_step_update(task, "stage_5_complete_purchase", "completed", 100, "✅ 购买流程完成")
+            self._send_log(task, "success", "🎉 阶段5：完成购买流程 - 成功完成")
+            return True
+
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            self._send_step_update(task, "stage_5_complete_purchase", "failed", 100, f"完成购买流程失败: {str(e)}")
+            self._send_log(task, "error", f"❌ 阶段5失败: {str(e)}")
+            return False
+
     async def initialize(self, task: Task) -> bool:
         """初始化Playwright"""
         try:
             self._send_step_update(task, "initializing", "started", message="正在启动浏览器...")
             self._send_log(task, "info", "🚀 正在初始化浏览器...")
 
-            self.playwright = await async_playwright().start()
+            # 为每个任务创建独立的playwright实例
+            task_playwright = await async_playwright().start()
+            self.task_playwrights[task.id] = task_playwright
             self._send_step_update(task, "initializing", "progress", 30, "Playwright已启动")
-            
-            self.browser = await self.playwright.chromium.launch(
+
+            # 为每个任务创建独立的browser实例
+            task_browser = await task_playwright.chromium.launch(
                 headless=False,
                 args=['--no-sandbox', '--disable-setuid-sandbox']
             )
+            self.task_browsers[task.id] = task_browser
             self._send_step_update(task, "initializing", "progress", 80, "浏览器已启动")
 
             self._send_log(task, "success", "✅ Playwright初始化成功")
@@ -347,8 +530,13 @@ class AutomationService:
     async def navigate_to_product(self, task: Task) -> bool:
         """导航到产品URL"""
         try:
+            # 获取任务特定的browser实例
+            task_browser = self.task_browsers.get(task.id)
+            if not task_browser:
+                raise Exception(f"任务 {task.id[:8]} 的browser实例不存在")
+
             # 创建新的浏览器上下文和页面
-            context = await self.browser.new_context(locale="en-GB")
+            context = await task_browser.new_context(locale="en-GB")
             page = await context.new_page()
             
             self.contexts[task.id] = context
@@ -370,6 +558,25 @@ class AutomationService:
             page = self.pages.get(task.id)
             if not page:
                 raise Exception("Page not found for task")
+
+            # 检查是否是测试产品
+            is_test_product = task.config.product_config.model == 'test-product'
+
+            if is_test_product:
+                task.add_log("🧪 检测到简单产品，只执行Add to Bag操作", "info")
+                # 等待页面加载完成
+                await page.wait_for_load_state('domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(3000)
+
+                # 只执行Add to Bag操作，不包括checkout和登录
+                task.add_log("🛒 添加商品到购物袋...", "info")
+                success = await self._click_add_to_bag_button(page, task)
+                if not success:
+                    task.add_log("❌ 添加到购物袋失败", "error")
+                    return False
+
+                task.add_log("🎉 简单产品Add to Bag完成", "success")
+                return True
 
             task.add_log("🔧 开始配置产品选项（跳过尺寸/颜色/内存）...", "info")
 
@@ -406,9 +613,56 @@ class AutomationService:
 
             task.add_log("🎉 产品配置完成", "success")
             return True
-            
+
         except Exception as e:
             task.add_log(f"❌ 产品配置失败: {str(e)}", "error")
+            return False
+
+    async def _click_add_to_bag(self, page: Page, task: Task):
+        """点击Add to Bag按钮"""
+        try:
+            task.add_log("🔍 查找Add to Bag按钮...", "info")
+
+            # 等待页面稳定
+            await page.wait_for_timeout(2000)
+
+            # 可能的Add to Bag按钮选择器 - 避免Apple Pay按钮
+            add_to_bag_selectors = [
+                'button:has-text("Add to Bag"):not(:has-text("Apple Pay"))',
+                'button:has-text("Add to bag"):not(:has-text("Apple Pay"))',
+                'button[data-autom="add-to-cart"]:not([data-autom*="apple-pay"])',
+                'button[data-autom="addToCart"]:not([data-autom*="apple-pay"])',
+                '.rs-add-to-cart-button:not(:has-text("Apple Pay"))',
+                'button:has-text("Add to Cart"):not(:has-text("Apple Pay"))',
+                'button:has-text("Buy Now"):not(:has-text("Apple Pay"))',
+                '[data-autom="add-to-bag-button"]:not([data-autom*="apple-pay"])',
+                '.rs-bag-button',
+                '.add-to-bag-button',
+                'button[class*="add-to-bag"]:not(:has-text("Apple Pay"))'
+            ]
+
+            for selector in add_to_bag_selectors:
+                try:
+                    button = await page.wait_for_selector(selector, timeout=5000)
+                    if button:
+                        # 验证这不是Apple Pay按钮
+                        button_text = await button.text_content()
+                        if button_text and ("apple pay" in button_text.lower() or "check out" in button_text.lower()):
+                            task.add_log(f"跳过Apple Pay/Check Out按钮: {button_text}", "warning")
+                            continue
+
+                        await button.click()
+                        task.add_log(f"✅ 点击Add to Bag按钮成功: {selector}", "success")
+                        await page.wait_for_timeout(3000)
+                        return True
+                except:
+                    continue
+
+            task.add_log("❌ 未找到Add to Bag按钮", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 点击Add to Bag按钮失败: {e}", "error")
             return False
     
     async def add_to_bag(self, task: Task) -> bool:
@@ -460,25 +714,31 @@ class AutomationService:
         await page.wait_for_timeout(2000)
 
         # 尝试多种Add to Bag按钮选择器（来自apple_automator.py）
+        # 注意：避免点击"Check Out with Apple Pay"按钮
         selectors = [
-            # 最常见的选择器
-            'button[data-autom*="add-to-cart"]',
-            'button[data-autom*="addToCart"]',
-            '[data-autom="add-to-cart"]',
+            # 最常见的选择器 - 确保不是Apple Pay按钮
+            'button[data-autom*="add-to-cart"]:not([data-autom*="apple-pay"])',
+            'button[data-autom*="addToCart"]:not([data-autom*="apple-pay"])',
+            '[data-autom="add-to-cart"]:not([data-autom*="apple-pay"])',
 
-            # 文本匹配
-            'button:has-text("Add to Bag")',
-            'button:has-text("Add to Cart")',
-            'button:has-text("添加到购物袋")',
+            # 文本匹配 - 精确匹配Add to Bag，避免Apple Pay
+            'button:has-text("Add to Bag"):not(:has-text("Apple Pay"))',
+            'button:has-text("Add to Cart"):not(:has-text("Apple Pay"))',
+            'button:has-text("添加到购物袋"):not(:has-text("Apple Pay"))',
 
-            # 通用按钮选择器
-            '.as-buttongroup-item button',
-            'button[aria-label*="Add"]',
-            'button[aria-label*="add"]',
+            # 通用按钮选择器 - 排除Apple Pay
+            '.as-buttongroup-item button:not(:has-text("Apple Pay"))',
+            'button[aria-label*="Add"]:not([aria-label*="Apple Pay"])',
+            'button[aria-label*="add"]:not([aria-label*="Apple Pay"])',
 
-            # 更广泛的搜索
-            'button:has-text("Add")',
-            '[role="button"]:has-text("Add to Bag")',
+            # 更广泛的搜索 - 排除Apple Pay
+            'button:has-text("Add"):not(:has-text("Apple Pay")):not(:has-text("Check Out"))',
+            '[role="button"]:has-text("Add to Bag"):not(:has-text("Apple Pay"))',
+
+            # 特定的Add to Bag按钮（通常在Apple Pay按钮下方）
+            '.rs-bag-button',
+            '.add-to-bag-button',
+            'button[class*="add-to-bag"]',
         ]
 
         for selector in selectors:
@@ -489,6 +749,12 @@ class AutomationService:
 
                 # 等待元素可见 - 🚀 增加超时时间
                 await element.wait_for(state='visible', timeout=20000)
+
+                # 验证这不是Apple Pay按钮
+                element_text = await element.text_content()
+                if element_text and ("apple pay" in element_text.lower() or "check out" in element_text.lower()):
+                    task.add_log(f"跳过Apple Pay/Check Out按钮: {element_text}", "warning")
+                    continue
 
                 # 滚动到元素位置
                 await element.scroll_into_view_if_needed()
@@ -550,69 +816,9 @@ class AutomationService:
             # 等待页面稳定
             await page.wait_for_timeout(3000)
 
-            # 多种Review Bag按钮选择策略（来自apple_automator.py）
-            review_bag_strategies = [
-                # 策略1: 原始选择器
-                lambda: page.get_by_role('button', name='Review Bag'),
-                # 策略2: 不同的文本变体
-                lambda: page.get_by_role('button', name='Review bag'),
-                lambda: page.get_by_role('button', name='View Bag'),
-                lambda: page.get_by_role('button', name='Go to Bag'),
-                # 策略3: 通过文本内容查找
-                lambda: page.locator('button:has-text("Review Bag")'),
-                lambda: page.locator('button:has-text("Review bag")'),
-                lambda: page.locator('button:has-text("View Bag")'),
-                lambda: page.locator('button:has-text("Go to Bag")'),
-                # 策略4: 通过data属性
-                lambda: page.locator('[data-autom*="bag"], [data-autom*="review"]'),
-                # 策略5: 通过类名或ID
-                lambda: page.locator('.review-bag, .view-bag, #reviewBag, #viewBag'),
-            ]
-
-            review_bag_success = False
-            for i, strategy in enumerate(review_bag_strategies, 1):
-                try:
-                    task.add_log(f"尝试Review Bag策略 {i}", "info")
-                    review_bag_button = strategy()
-
-                    # 检查按钮是否存在
-                    button_count = await review_bag_button.count()
-                    if button_count == 0:
-                        task.add_log(f"策略 {i}: 按钮不存在", "warning")
-                        continue
-
-                    # 检查按钮是否可见
-                    is_visible = await review_bag_button.is_visible()
-                    if not is_visible:
-                        task.add_log(f"策略 {i}: 按钮存在但不可见，尝试滚动到视图", "info")
-                        await review_bag_button.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(1000)
-                        is_visible = await review_bag_button.is_visible()
-
-                    if not is_visible:
-                        task.add_log(f"策略 {i}: 按钮仍然不可见", "warning")
-                        continue
-
-                    # 检查按钮是否可点击
-                    is_enabled = await review_bag_button.is_enabled()
-                    if not is_enabled:
-                        task.add_log(f"策略 {i}: 按钮不可点击", "warning")
-                        continue
-
-                    # 尝试点击
-                    await review_bag_button.click()
-                    task.add_log(f"✅ 成功点击Review Bag按钮 (策略{i})", "success")
-                    review_bag_success = True
-                    break
-
-                except Exception as e:
-                    task.add_log(f"Review Bag策略 {i} 失败: {e}", "warning")
-                    continue
-
-            if not review_bag_success:
-                # 尝试备用策略
-                task.add_log("尝试备用Review Bag策略...", "info")
-                await self._try_fallback_review_bag(page, task)
+            # 直接使用有效的智能策略
+            task.add_log("🔍 使用智能Review Bag策略...", "info")
+            await self._try_fallback_review_bag(page, task)
 
             # 等待进入购物袋页面 - 🚀 增加超时时间应对网络延迟
             try:
@@ -1943,6 +2149,587 @@ class AutomationService:
             task.add_log(f"❌ 继续礼品卡应用失败: {e}", "error")
             return False
 
+    async def _click_review_your_order(self, page: Page, task: Task):
+        """点击Review Your Order按钮进入下一页面"""
+        try:
+            task.add_log("🔍 查找Review Your Order按钮...", "info")
+
+            # 等待页面稳定
+            await page.wait_for_timeout(3000)
+
+            # 可能的Review Your Order按钮选择器
+            review_selectors = [
+                'button:has-text("Review Your Order")',
+                'button:has-text("Review your order")',
+                'button:has-text("Review Order")',
+                'button[data-autom="review-order-button"]',
+                'button[data-autom="reviewOrderButton"]',
+                '.rs-review-order-button',
+                'a:has-text("Review Your Order")',
+                'a:has-text("Review your order")'
+            ]
+
+            for selector in review_selectors:
+                try:
+                    button = await page.wait_for_selector(selector, timeout=5000)
+                    if button:
+                        await button.click()
+                        task.add_log(f"✅ 点击Review Your Order按钮成功: {selector}", "success")
+                        await page.wait_for_timeout(3000)
+                        return True
+                except:
+                    continue
+
+            task.add_log("❌ 未找到Review Your Order按钮", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 点击Review Your Order按钮失败: {e}", "error")
+            return False
+
+    async def _check_gift_card_balance_and_proceed(self, page: Page, task: Task):
+        """检查礼品卡余额是否充足并进入下一步"""
+        try:
+            task.add_log("🔍 检查礼品卡余额状态...", "info")
+
+            # 等待页面加载
+            await page.wait_for_timeout(3000)
+
+            # 检查是否显示余额充足的消息
+            balance_sufficient_text = "Your Apple Gift Card covers your entire purchase, so you don't need to add a credit card payment"
+
+            try:
+                # 查找余额充足的文本
+                balance_element = await page.wait_for_selector(
+                    f"text={balance_sufficient_text}",
+                    timeout=5000
+                )
+
+                if balance_element:
+                    task.add_log("✅ 礼品卡余额充足，无需添加信用卡", "success")
+
+                    # 查找并点击继续按钮
+                    await self._click_continue_button(page, task)
+
+                    # 进入审核页面
+                    await self._handle_review_page(page, task)
+
+                    return True
+
+            except Exception:
+                # 检查是否显示余额不足的消息
+                insufficient_balance_result = await self._check_insufficient_balance(page, task)
+                if insufficient_balance_result:
+                    # 余额不足，需要用户输入更多礼品卡
+                    return await self._handle_insufficient_balance(page, task, insufficient_balance_result)
+                else:
+                    # 如果无法确定余额状态，默认认为是余额不足，等待用户输入更多礼品卡
+                    task.add_log("⚠️ 未检测到明确的余额状态消息，默认认为余额不足", "warning")
+                    task.add_log("💳 可能余额不足，等待用户输入更多礼品卡", "warning")
+
+                    # 创建一个默认的余额不足结果
+                    default_insufficient_result = {
+                        "insufficient": True,
+                        "remaining_amount": "未知金额",
+                        "currency": "$"
+                    }
+
+                    return await self._handle_insufficient_balance(page, task, default_insufficient_result)
+
+        except Exception as e:
+            task.add_log(f"❌ 检查余额状态失败: {e}", "error")
+            return False
+
+    async def _check_insufficient_balance(self, page: Page, task: Task):
+        """检查是否显示余额不足的消息并提取所需金额"""
+        try:
+            # 等待页面稳定
+            await page.wait_for_timeout(2000)
+
+            # 获取页面文本内容
+            page_content = await page.content()
+
+            # 添加调试信息：查看页面中是否包含余额相关的文本
+            task.add_log("🔍 搜索页面中的余额相关信息...", "info")
+
+            # 调试：查找页面中包含"balance"、"payment"、"remaining"等关键词的文本
+            balance_keywords = ["balance", "payment", "remaining", "cover", "additional"]
+            for keyword in balance_keywords:
+                if keyword.lower() in page_content.lower():
+                    # 提取包含关键词的句子（前后50个字符）
+                    import re
+                    pattern = rf".{{0,50}}{re.escape(keyword)}.{{0,50}}"
+                    matches = re.findall(pattern, page_content, re.IGNORECASE)
+                    for match in matches[:3]:  # 只显示前3个匹配
+                        task.add_log(f"🔍 找到关键词 '{keyword}': ...{match.strip()}...", "info")
+
+            # 检查余额不足的消息模式
+            import re
+
+            # 匹配 "Please enter another form of payment to cover the remaining balance of £XX.XX"
+            # 更精确的模式，避免匹配到其他内容
+            balance_patterns = [
+                r"Please enter another form of payment to cover the remaining balance of £([\d,]+\.?\d*)",
+                r"Please enter another form of payment to cover the remaining balance of \$([\d,]+\.?\d*)",
+                r"to cover the remaining balance of £([\d,]+\.?\d*)",
+                r"to cover the remaining balance of \$([\d,]+\.?\d*)",
+                r"remaining balance of £([\d,]+\.?\d*)",
+                r"remaining balance of \$([\d,]+\.?\d*)"
+            ]
+
+            for i, pattern in enumerate(balance_patterns):
+                match = re.search(pattern, page_content, re.IGNORECASE)
+                if match:
+                    remaining_amount = match.group(1)
+                    # 确定货币符号
+                    currency = "£" if "£" in pattern else "$"
+
+                    # 调试信息：显示匹配的模式和完整匹配内容
+                    task.add_log(f"🔍 模式 {i+1} 匹配成功: {pattern}", "info")
+                    task.add_log(f"🔍 完整匹配内容: {match.group(0)}", "info")
+                    task.add_log(f"🔍 提取的金额: {remaining_amount}", "info")
+
+                    task.add_log(f"⚠️ 检测到余额不足，还需要 {currency}{remaining_amount}", "warning")
+                    return {
+                        "insufficient": True,
+                        "remaining_amount": remaining_amount,
+                        "currency": currency
+                    }
+
+            return None
+
+        except Exception as e:
+            task.add_log(f"❌ 检查余额不足状态失败: {e}", "error")
+            return None
+
+    async def _handle_insufficient_balance(self, page: Page, task: Task, balance_info: dict):
+        """处理余额不足的情况，请求用户输入更多礼品卡"""
+        try:
+            remaining_amount = balance_info["remaining_amount"]
+            currency = balance_info["currency"]
+
+            task.add_log(f"💳 余额不足，还需要 {currency}{remaining_amount}", "warning")
+
+            # 发送余额不足的消息到前端
+            self._send_insufficient_balance_request(task, remaining_amount, currency)
+
+            # 设置任务状态为等待礼品卡输入
+            task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+            task.add_log("⏳ 等待用户输入更多礼品卡...", "info")
+
+            # 进入等待循环，直到用户输入更多礼品卡
+            await self._wait_for_additional_gift_cards(page, task)
+
+            return True  # 等待完成后返回True继续流程
+
+        except Exception as e:
+            task.add_log(f"❌ 处理余额不足失败: {e}", "error")
+            return False
+
+    def _send_insufficient_balance_request(self, task: Task, remaining_amount: str, currency: str):
+        """发送余额不足请求到前端"""
+        try:
+            # 通过WebSocket发送到前端
+            if hasattr(self, 'websocket_handler') and self.websocket_handler:
+                # 直接使用broadcast方法发送事件
+                event_data = {
+                    "task_id": task.id,
+                    "remaining_amount": remaining_amount,
+                    "currency": currency,
+                    "message": f"礼品卡余额不足，还需要 {currency}{remaining_amount}，请输入更多礼品卡"
+                }
+
+                # 添加调试信息
+                task.add_log(f"🔍 准备发送WebSocket事件: insufficient_balance", "info")
+                task.add_log(f"🔍 事件数据: {event_data}", "info")
+
+                self.websocket_handler.broadcast('insufficient_balance', event_data)
+                task.add_log(f"✅ 已发送余额不足请求到前端: {currency}{remaining_amount}", "info")
+
+                # 同时发送礼品卡输入请求，确保前端显示对话框
+                self._send_gift_card_input_request(task)
+
+            else:
+                task.add_log("❌ WebSocket处理器不可用", "error")
+
+        except Exception as e:
+            task.add_log(f"❌ 发送余额不足请求失败: {e}", "error")
+
+    def _send_gift_card_input_request(self, task: Task):
+        """发送礼品卡输入请求到前端"""
+        try:
+            if hasattr(self, 'websocket_handler') and self.websocket_handler:
+                event_data = {
+                    "task_id": task.id,
+                    "message": "请输入更多礼品卡",
+                    "type": "gift_card_input_required"
+                }
+                self.websocket_handler.broadcast('gift_card_input_required', event_data)
+                task.add_log("✅ 已发送礼品卡输入请求到前端", "info")
+        except Exception as e:
+            task.add_log(f"❌ 发送礼品卡输入请求失败: {e}", "error")
+
+    def _send_gift_card_error(self, task: Task, error_message: str, gift_card_number: str = None):
+        """发送礼品卡错误事件到前端"""
+        try:
+            if hasattr(self, 'websocket_handler') and self.websocket_handler:
+                # 格式化错误消息，包含礼品卡号
+                if gift_card_number:
+                    formatted_message = f"礼品卡 {gift_card_number[:4]}**** - {error_message}"
+                else:
+                    formatted_message = error_message
+
+                event_data = {
+                    "task_id": task.id,
+                    "error_message": formatted_message,
+                    "gift_card_number": gift_card_number[:4] + "****" if gift_card_number else None
+                }
+                self.websocket_handler.broadcast('gift_card_error', event_data)
+                task.add_log(f"✅ 已发送礼品卡错误事件到前端: {formatted_message}", "info")
+        except Exception as e:
+            task.add_log(f"❌ 发送礼品卡错误事件失败: {e}", "error")
+
+    def _send_gift_card_success(self, task: Task, message: str):
+        """发送礼品卡成功事件到前端"""
+        try:
+            if hasattr(self, 'websocket_handler') and self.websocket_handler:
+                event_data = {
+                    "task_id": task.id,
+                    "message": message
+                }
+                self.websocket_handler.broadcast('gift_card_success', event_data)
+                task.add_log(f"✅ 已发送礼品卡成功事件到前端: {message}", "info")
+        except Exception as e:
+            task.add_log(f"❌ 发送礼品卡成功事件失败: {e}", "error")
+
+    async def _wait_for_additional_gift_cards(self, page: Page, task: Task):
+        """等待用户输入更多礼品卡"""
+        import asyncio
+
+        try:
+            task.add_log("⏳ 进入等待模式，等待用户输入更多礼品卡...", "info")
+
+            # 设置等待状态
+            task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+
+            # 等待用户输入更多礼品卡（通过WebSocket提交）
+            # 这里使用一个循环等待，直到任务状态改变
+            max_wait_time = 300  # 最大等待5分钟
+            wait_interval = 1    # 每秒检查一次
+            waited_time = 0
+
+            while waited_time < max_wait_time:
+                await asyncio.sleep(wait_interval)
+                waited_time += wait_interval
+
+                # 检查任务状态是否已经改变（用户提交了礼品卡）
+                if task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
+                    task.add_log("✅ 检测到用户已提交更多礼品卡，开始应用新礼品卡", "info")
+
+                    # 应用新提交的礼品卡
+                    try:
+                        await self._apply_additional_gift_cards(page, task)
+                        task.add_log("✅ 新礼品卡应用完成，重新检查余额", "info")
+
+                        # 发送礼品卡成功事件
+                        self._send_gift_card_success(task, "礼品卡应用成功，正在检查余额...")
+
+                        return True
+                    except Exception as e:
+                        task.add_log(f"❌ 应用新礼品卡失败: {e}", "error")
+
+                        # 重新设置等待状态，继续等待用户输入
+                        task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+                        task.add_log("⏳ 礼品卡应用失败，继续等待用户输入新的礼品卡...", "warning")
+
+                        # 不返回False，继续等待循环
+
+                # 每30秒提醒一次
+                if waited_time % 30 == 0:
+                    task.add_log(f"⏳ 仍在等待用户输入礼品卡... ({waited_time}s/{max_wait_time}s)", "info")
+
+            # 超时
+            task.add_log("⏰ 等待用户输入礼品卡超时", "warning")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 等待用户输入礼品卡失败: {e}", "error")
+            return False
+
+    async def _apply_additional_gift_cards(self, page: Page, task: Task):
+        """应用用户新提交的礼品卡"""
+        try:
+            task.add_log("🎁 开始应用新提交的礼品卡", "info")
+
+            # 获取最新的礼品卡信息
+            gift_card_numbers = []
+            if task.config.gift_cards:
+                # 获取所有礼品卡，包括新添加的
+                gift_card_numbers = [gc.number for gc in task.config.gift_cards]
+                task.add_log(f"📋 获取到 {len(gift_card_numbers)} 张礼品卡", "info")
+
+            if not gift_card_numbers:
+                raise Exception("没有找到新的礼品卡信息")
+
+            # 点击"Add another card"链接添加新礼品卡
+            task.add_log("🔗 点击添加另一张礼品卡...", "info")
+            await self._click_add_another_card(page, task)
+
+            # 应用最后一张礼品卡（新添加的）
+            latest_gift_card = gift_card_numbers[-1]
+            task.add_log(f"🎯 应用新礼品卡: {latest_gift_card[:4]}****", "info")
+
+            # 填写礼品卡号码
+            await self._sota_fill_gift_card_input(page, task, latest_gift_card)
+
+            # 点击Apply按钮
+            await self._apply_gift_card_and_get_feedback(page, task, latest_gift_card)
+
+            task.add_log("✅ 新礼品卡应用完成", "success")
+
+        except Exception as e:
+            error_message = str(e)
+            task.add_log(f"❌ 应用新礼品卡失败: {error_message}", "error")
+
+            # 获取最新的礼品卡号用于错误显示
+            latest_gift_card = None
+            if task.config.gift_cards:
+                gift_card_numbers = [gc.number for gc in task.config.gift_cards]
+                if gift_card_numbers:
+                    latest_gift_card = gift_card_numbers[-1]  # 最后一张礼品卡
+
+            # 发送礼品卡错误事件到前端，包含礼品卡号
+            self._send_gift_card_error(task, error_message, latest_gift_card)
+
+            raise
+
+    async def _click_continue_button(self, page: Page, task: Task):
+        """点击继续按钮"""
+        try:
+            task.add_log("🔍 查找继续按钮...", "info")
+
+            # 可能的继续按钮选择器
+            continue_selectors = [
+                'button[data-autom="continueButton"]',
+                'button:has-text("Continue")',
+                'button:has-text("Proceed")',
+                'button:has-text("Next")',
+                '.rs-continue-button',
+                '[data-autom="checkout-continue-button"]'
+            ]
+
+            for selector in continue_selectors:
+                try:
+                    button = await page.wait_for_selector(selector, timeout=5000)
+                    if button:
+                        await button.click()
+                        task.add_log(f"✅ 点击继续按钮成功: {selector}", "success")
+                        await page.wait_for_timeout(3000)
+                        return True
+                except:
+                    continue
+
+            task.add_log("❌ 未找到继续按钮", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 点击继续按钮失败: {e}", "error")
+            return False
+
+    async def _handle_review_page(self, page: Page, task: Task):
+        """处理审核页面 (Review页面)"""
+        try:
+            task.add_log("🔍 等待进入审核页面...", "info")
+
+            # 等待URL变为Review页面
+            await page.wait_for_function(
+                "window.location.href.includes('checkout?_s=Review')",
+                timeout=30000
+            )
+
+            current_url = page.url
+            task.add_log(f"✅ 已进入审核页面: {current_url}", "success")
+
+            # 处理Terms & Conditions复选框
+            await self._handle_terms_and_conditions(page, task)
+
+            # 点击Place your order按钮
+            await self._place_order(page, task)
+
+            # 处理最终确认页面
+            await self._handle_thank_you_page(page, task)
+
+        except Exception as e:
+            task.add_log(f"❌ 处理审核页面失败: {e}", "error")
+            raise
+
+    async def _handle_terms_and_conditions(self, page: Page, task: Task):
+        """处理Terms & Conditions复选框"""
+        try:
+            task.add_log("🔍 查找Terms & Conditions复选框...", "info")
+
+            # 可能的复选框选择器
+            checkbox_selectors = [
+                'input[type="checkbox"][data-autom="terms-checkbox"]',
+                'input[type="checkbox"]:near(:text("Terms and Conditions"))',
+                'input[type="checkbox"]:near(:text("I have read, understand and agree"))',
+                '.rs-terms-checkbox input[type="checkbox"]',
+                '[data-autom="terms-and-conditions-checkbox"]'
+            ]
+
+            for selector in checkbox_selectors:
+                try:
+                    checkbox = await page.wait_for_selector(selector, timeout=5000)
+                    if checkbox:
+                        # 检查是否已经选中
+                        is_checked = await checkbox.is_checked()
+                        if not is_checked:
+                            await checkbox.click()
+                            task.add_log("✅ 已选中Terms & Conditions复选框", "success")
+                        else:
+                            task.add_log("✅ Terms & Conditions复选框已选中", "info")
+                        return True
+                except:
+                    continue
+
+            task.add_log("❌ 未找到Terms & Conditions复选框", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 处理Terms & Conditions失败: {e}", "error")
+            return False
+
+    async def _place_order(self, page: Page, task: Task):
+        """点击Place your order按钮"""
+        try:
+            task.add_log("🔍 查找Place your order按钮...", "info")
+
+            # 可能的下单按钮选择器
+            order_button_selectors = [
+                'button:has-text("Place your order")',
+                'button[data-autom="place-order-button"]',
+                'button[data-autom="placeOrderButton"]',
+                '.rs-place-order-button',
+                'button:has-text("Place Order")'
+            ]
+
+            for selector in order_button_selectors:
+                try:
+                    button = await page.wait_for_selector(selector, timeout=5000)
+                    if button:
+                        await button.click()
+                        task.add_log("✅ 点击Place your order按钮成功", "success")
+                        await page.wait_for_timeout(3000)
+                        return True
+                except:
+                    continue
+
+            task.add_log("❌ 未找到Place your order按钮", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 点击Place your order按钮失败: {e}", "error")
+            return False
+
+    async def _handle_thank_you_page(self, page: Page, task: Task):
+        """处理感谢页面并提取订单信息"""
+        try:
+            task.add_log("🔍 等待进入感谢页面...", "info")
+
+            # 等待URL变为thankyou页面
+            await page.wait_for_function(
+                "window.location.href.includes('checkout/thankyou')",
+                timeout=60000
+            )
+
+            current_url = page.url
+            task.add_log(f"✅ 已进入感谢页面: {current_url}", "success")
+
+            # 查找确认邮件信息
+            await self._extract_confirmation_email(page, task)
+
+            # 提取订单号
+            order_link = await self._extract_order_number(page, task)
+
+            if order_link:
+                task.add_log(f"🎉 购买流程完成！订单链接: {order_link}", "success")
+
+                # 更新任务状态为完成
+                task.status = TaskStatus.COMPLETED
+                self._send_step_update(task, "purchase_completed", "completed", 100, "购买流程完成")
+
+                return order_link
+            else:
+                task.add_log("⚠️ 未能提取订单号", "warning")
+                return None
+
+        except Exception as e:
+            task.add_log(f"❌ 处理感谢页面失败: {e}", "error")
+            return None
+
+    async def _extract_confirmation_email(self, page: Page, task: Task):
+        """提取确认邮件信息"""
+        try:
+            # 查找确认邮件文本
+            email_text_pattern = r"We'll send confirmation and delivery updates to: (.+@.+\..+)"
+
+            page_content = await page.content()
+            import re
+            match = re.search(email_text_pattern, page_content)
+
+            if match:
+                email = match.group(1)
+                task.add_log(f"📧 确认邮件将发送至: {email}", "info")
+                return email
+            else:
+                task.add_log("⚠️ 未找到确认邮件信息", "warning")
+                return None
+
+        except Exception as e:
+            task.add_log(f"❌ 提取确认邮件失败: {e}", "error")
+            return None
+
+    async def _extract_order_number(self, page: Page, task: Task):
+        """提取订单号链接"""
+        try:
+            task.add_log("🔍 查找订单号链接...", "info")
+
+            # 查找订单号链接
+            order_link_selector = 'a[data-autom="order-number"]'
+
+            try:
+                order_element = await page.wait_for_selector(order_link_selector, timeout=10000)
+                if order_element:
+                    href = await order_element.get_attribute('href')
+                    order_text = await order_element.text_content()
+
+                    task.add_log(f"✅ 找到订单号: {order_text}", "success")
+                    task.add_log(f"🔗 订单链接: {href}", "info")
+
+                    return href
+
+            except:
+                # 如果找不到特定选择器，尝试其他方法
+                task.add_log("🔍 尝试其他方法查找订单号...", "info")
+
+                # 查找包含订单号的链接
+                order_links = await page.query_selector_all('a[href*="vieworder"]')
+                for link in order_links:
+                    href = await link.get_attribute('href')
+                    text = await link.text_content()
+
+                    if 'Order No.' in text or 'W' in text:
+                        task.add_log(f"✅ 找到订单号: {text}", "success")
+                        task.add_log(f"🔗 订单链接: {href}", "info")
+                        return href
+
+            task.add_log("❌ 未找到订单号链接", "error")
+            return None
+
+        except Exception as e:
+            task.add_log(f"❌ 提取订单号失败: {e}", "error")
+            return None
+
             # 获取前端传递的真实礼品卡配置（保留原有代码以防需要）
             gift_card_code = getattr(task.config, 'gift_card_code', None)
             gift_cards = getattr(task.config, 'gift_cards', None)
@@ -2176,8 +2963,13 @@ class AutomationService:
             # 获取Playwright代理配置
             proxy_config = self.ip_service.get_proxy_config_for_playwright()
             
+            # 获取任务特定的browser实例
+            task_browser = self.task_browsers.get(task.id)
+            if not task_browser:
+                raise Exception(f"任务 {task.id[:8]} 的browser实例不存在")
+
             # 创建新的上下文（使用新代理）
-            new_context = await self.browser.new_context(
+            new_context = await task_browser.new_context(
                 locale="en-GB",
                 proxy=proxy_config
             )
@@ -2466,8 +3258,9 @@ class AutomationService:
             'text="Enter your gift card number"',
             'a:has-text("Enter your gift card number")',
             'text="Do you have an Apple Gift Card?"',
-            'button:has-text("gift card")',
-            'a:has-text("gift card")'
+            # 更精确的选择器，避免匹配到Add to Bag等按钮
+            'button:has-text("Enter your gift card number")',
+            'a:has-text("Do you have an Apple Gift Card?")'
         ]
 
         link_found = False
@@ -2719,11 +3512,11 @@ class AutomationService:
             lambda: page.locator('text="Use gift card"').first,
             lambda: page.locator('text="Gift card"').first,
 
-            # 策略2: 通过角色和文本查找
-            lambda: page.locator('button:has-text("Gift Card")').first,
-            lambda: page.locator('button:has-text("gift card")').first,
-            lambda: page.locator('a:has-text("Gift Card")').first,
-            lambda: page.locator('a:has-text("gift card")').first,
+            # 策略2: 通过角色和文本查找（更精确的选择器）
+            lambda: page.locator('button:has-text("Do you have an Apple Gift Card?")').first,
+            lambda: page.locator('button:has-text("Enter your gift card number")').first,
+            lambda: page.locator('a:has-text("Do you have an Apple Gift Card?")').first,
+            lambda: page.locator('a:has-text("Apply an Apple Gift Card")').first,
             lambda: page.locator('a:has-text("Enter your gift card number")').first,  # 重要的a标签
 
             # 策略3: 通过data属性查找
@@ -3619,7 +4412,10 @@ class AutomationService:
             if not gift_card_numbers:
                 raise Exception("没有找到礼品卡信息")
 
-            # 应用每张礼品卡
+            # 应用每张礼品卡，记录成功和失败的卡
+            successful_cards = []
+            failed_cards = []
+
             for i, gift_card_number in enumerate(gift_card_numbers, 1):
                 task.add_log(f"🎯 应用第 {i} 张礼品卡: {gift_card_number[:4]}****", "info")
 
@@ -3637,7 +4433,16 @@ class AutomationService:
                     task.add_log(f"✅ 点击Apply按钮应用第 {i} 张礼品卡...", "info")
                     await self._apply_gift_card_and_get_feedback(page, task, gift_card_number)
 
-                    task.add_log(f"🎉 第 {i} 张礼品卡应用完成", "success")
+                    task.add_log(f"🎉 第 {i} 张礼品卡应用成功", "success")
+                    successful_cards.append(gift_card_number)
+
+                    # 检查页面是否已跳转到下一步（说明余额充足）
+                    current_url = page.url
+                    if "checkout?_s=Billing-init" in current_url or "checkout?_s=Review" in current_url:
+                        task.add_log(f"✅ 页面已跳转到下一步，余额充足，停止应用剩余礼品卡", "success")
+                        task.add_log(f"🔍 当前URL: {current_url}", "info")
+                        # 余额充足，不需要应用剩余的礼品卡
+                        break
 
                     # 如果还有更多礼品卡，等待页面更新并准备下一张
                     if i < len(gift_card_numbers):
@@ -3647,14 +4452,161 @@ class AutomationService:
 
                 except Exception as e:
                     task.add_log(f"❌ 第 {i} 张礼品卡应用失败: {e}", "error")
+                    failed_cards.append({"number": gift_card_number, "error": str(e)})
+                    # 发送错误事件到前端，包含礼品卡号
+                    self._send_gift_card_error(task, str(e), gift_card_number)
                     # 继续处理下一张礼品卡
                     continue
 
-            task.add_log("✅ 所有礼品卡应用完成", "success")
+            # 检查应用结果
+            if failed_cards:
+                task.add_log(f"⚠️ 礼品卡应用结果: 成功 {len(successful_cards)} 张，失败 {len(failed_cards)} 张", "warning")
+                for failed_card in failed_cards:
+                    task.add_log(f"❌ 失败的礼品卡: {failed_card['number'][:4]}**** - {failed_card['error']}", "error")
+
+                # 如果有失败的礼品卡，返回False表示需要等待用户输入新的礼品卡
+                task.add_log("⏳ 有礼品卡应用失败，需要等待用户输入新的礼品卡", "warning")
+                return False
+            else:
+                task.add_log("✅ 所有礼品卡应用成功", "success")
+                return True
 
         except Exception as e:
             task.add_log(f"❌ 应用已有礼品卡失败: {str(e)}", "error")
-            raise
+            return False
+
+    async def _click_add_to_bag_button(self, page: Page, task: Task) -> bool:
+        """只点击Add to Bag按钮，不包括后续的checkout流程"""
+        try:
+            task.add_log("🛒 正在将商品添加到购物袋...", "info")
+
+            # Add to Bag按钮选择器（按优先级排序）
+            add_to_bag_selectors = [
+                'button[data-autom*="add-to-cart"]:not([data-autom*="apple-pay"])',
+                'button[data-autom*="addToCart"]:not([data-autom*="apple-pay"])',
+                '[data-autom="add-to-cart"]:not([data-autom*="apple-pay"])',
+                'button:has-text("Add to Bag"):not(:has-text("Apple Pay"))',
+                'button:has-text("Add to Cart"):not(:has-text("Apple Pay"))',
+                '[data-autom*="add-to-bag"]',
+                'button[aria-label*="Add to Bag"]',
+                'button[aria-label*="Add to Cart"]'
+            ]
+
+            for selector in add_to_bag_selectors:
+                try:
+                    task.add_log(f"尝试Add to Bag选择器: {selector}", "info")
+
+                    element = page.locator(selector).first
+
+                    # 等待元素可见
+                    await element.wait_for(state='visible', timeout=20000)
+
+                    # 验证这不是Apple Pay按钮
+                    element_text = await element.text_content()
+                    if element_text and ("apple pay" in element_text.lower() or "check out" in element_text.lower()):
+                        task.add_log(f"跳过Apple Pay/Check Out按钮: {element_text}", "warning")
+                        continue
+
+                    # 滚动到元素位置
+                    await element.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(1000)
+
+                    # 点击按钮
+                    await element.click()
+
+                    # 验证点击是否成功
+                    await page.wait_for_timeout(2000)
+
+                    task.add_log(f"✅ 成功点击Add to Bag: {selector}", "success")
+                    task.add_log("✅ 商品已成功添加到购物袋", "success")
+
+                    # 点击Check Out按钮进入checkout流程
+                    checkout_success = await self._click_checkout_button(page, task)
+                    if not checkout_success:
+                        task.add_log("❌ 点击Check Out按钮失败", "error")
+                        return False
+
+                    return True
+
+                except Exception as e:
+                    task.add_log(f"选择器 {selector} 失败: {e}", "warning")
+                    continue
+
+            # 如果所有选择器都失败
+            task.add_log("❌ 所有Add to Bag选择器都失败", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 点击Add to Bag按钮失败: {e}", "error")
+            return False
+
+    async def _click_checkout_button(self, page: Page, task: Task) -> bool:
+        """点击Check Out按钮进入checkout流程"""
+        try:
+            task.add_log("🛒 点击Check Out按钮进入checkout流程...", "info")
+
+            # Check Out按钮选择器（按优先级排序）
+            checkout_selectors = [
+                'button[data-autom*="checkout"]:not([data-autom*="apple-pay"])',
+                'button:has-text("Check Out"):not(:has-text("Apple Pay"))',
+                'button:has-text("Checkout"):not(:has-text("Apple Pay"))',
+                'a[data-autom*="checkout"]:not([data-autom*="apple-pay"])',
+                'a:has-text("Check Out"):not(:has-text("Apple Pay"))',
+                'a:has-text("Checkout"):not(:has-text("Apple Pay"))',
+                '[data-autom="checkout-button"]',
+                'button[aria-label*="Check Out"]',
+                'button[aria-label*="Checkout"]'
+            ]
+
+            for selector in checkout_selectors:
+                try:
+                    task.add_log(f"尝试Check Out选择器: {selector}", "info")
+
+                    element = page.locator(selector).first
+
+                    # 等待元素可见
+                    await element.wait_for(state='visible', timeout=15000)
+
+                    # 验证这不是Apple Pay按钮
+                    element_text = await element.text_content()
+                    if element_text and "apple pay" in element_text.lower():
+                        task.add_log(f"跳过Apple Pay按钮: {element_text}", "warning")
+                        continue
+
+                    # 滚动到元素位置
+                    await element.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(1000)
+
+                    # 点击按钮
+                    await element.click()
+
+                    # 等待页面跳转到checkout页面
+                    await page.wait_for_timeout(3000)
+
+                    # 验证是否成功进入checkout流程（包括登录页面）
+                    current_url = page.url
+                    if ("checkout" in current_url.lower() or
+                        "billing" in current_url.lower() or
+                        "signin" in current_url.lower() or
+                        "login" in current_url.lower()):
+                        task.add_log(f"✅ 成功点击Check Out按钮: {selector}", "success")
+                        task.add_log(f"✅ 已进入checkout流程: {current_url}", "success")
+                        return True
+                    else:
+                        task.add_log(f"⚠️ 点击后未进入checkout流程，当前URL: {current_url}", "warning")
+                        continue
+
+                except Exception as e:
+                    task.add_log(f"选择器 {selector} 失败: {e}", "warning")
+                    continue
+
+            # 如果所有选择器都失败
+            task.add_log("❌ 所有Check Out选择器都失败", "error")
+            return False
+
+        except Exception as e:
+            task.add_log(f"❌ 点击Check Out按钮失败: {e}", "error")
+            return False
 
     async def _handle_gift_card_input(self, page: Page, task: Task):
         """处理礼品卡输入 - 等待用户通过前端输入礼品卡信息"""
@@ -3694,11 +4646,21 @@ class AutomationService:
 
                 # 如果状态不再是等待输入，说明用户已经提交了
                 if current_task and current_task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
-                    task.add_log("✅ 检测到用户已提交礼品卡信息，继续执行", "success")
+                    task.add_log("✅ 检测到用户已提交礼品卡信息，开始应用礼品卡", "success")
                     # 更新本地任务对象的状态和配置
                     task.status = current_task.status
                     task.config = current_task.config
-                    return
+
+                    # 实际应用用户提交的礼品卡，检查返回值
+                    apply_result = await self._apply_submitted_gift_cards(page, task)
+                    if apply_result:
+                        task.add_log("✅ 用户提交的礼品卡应用成功", "success")
+                        return  # 成功，退出等待
+                    else:
+                        task.add_log("❌ 用户提交的礼品卡应用失败，继续等待新的输入", "warning")
+                        # 重新设置等待状态，继续循环
+                        task.status = TaskStatus.WAITING_GIFT_CARD_INPUT
+                        continue  # 失败，继续等待循环
 
                 # 每30秒提醒一次
                 if waited_time % 30 == 0:
@@ -3710,6 +4672,78 @@ class AutomationService:
 
         except Exception as e:
             task.add_log(f"❌ 礼品卡输入处理失败: {str(e)}", "error")
+            raise
+
+    async def _apply_submitted_gift_cards(self, page: Page, task: Task):
+        """应用用户提交的礼品卡"""
+        try:
+            task.add_log("🎁 开始应用用户提交的礼品卡", "info")
+
+            # 获取礼品卡信息
+            gift_card_numbers = []
+            if task.config.gift_cards:
+                gift_card_numbers = [gc.number for gc in task.config.gift_cards]
+                task.add_log(f"📋 从gift_cards获取到 {len(gift_card_numbers)} 张礼品卡", "info")
+            elif task.config.gift_card_code:  # 向后兼容
+                gift_card_numbers = [task.config.gift_card_code]
+                task.add_log(f"📋 从gift_card_code获取到礼品卡: {task.config.gift_card_code[:4]}****", "info")
+
+            if not gift_card_numbers:
+                raise Exception("没有找到礼品卡信息")
+
+            # 应用每张礼品卡，记录成功和失败的卡
+            successful_cards = []
+            failed_cards = []
+
+            for i, gift_card_number in enumerate(gift_card_numbers, 1):
+                task.add_log(f"🎯 应用第 {i} 张礼品卡: {gift_card_number[:4]}****", "info")
+
+                try:
+                    # 对于第一张礼品卡，需要点击链接打开输入框
+                    if i == 1:
+                        task.add_log("🔗 点击'Enter your gift card number'链接...", "info")
+                        await self._sota_click_gift_card_link(page, task)
+
+                    # 填写礼品卡号码
+                    task.add_log(f"📝 填写第 {i} 张礼品卡号码...", "info")
+                    await self._sota_fill_gift_card_input(page, task, gift_card_number)
+
+                    # 点击Apply按钮
+                    task.add_log(f"✅ 点击Apply按钮应用第 {i} 张礼品卡...", "info")
+                    await self._apply_gift_card_and_get_feedback(page, task, gift_card_number)
+
+                    task.add_log(f"🎉 第 {i} 张礼品卡应用成功", "success")
+                    successful_cards.append(gift_card_number)
+
+                    # 如果还有更多礼品卡，等待页面更新并准备下一张
+                    if i < len(gift_card_numbers):
+                        await page.wait_for_timeout(2000)
+                        task.add_log(f"🔄 准备添加下一张礼品卡 ({i + 1}/{len(gift_card_numbers)})", "info")
+                        await self._click_add_another_card(page, task)
+
+                except Exception as e:
+                    task.add_log(f"❌ 第 {i} 张礼品卡应用失败: {e}", "error")
+                    failed_cards.append({"number": gift_card_number, "error": str(e)})
+                    # 发送错误事件到前端，包含礼品卡号
+                    self._send_gift_card_error(task, str(e), gift_card_number)
+                    # 继续处理下一张礼品卡
+                    continue
+
+            # 检查应用结果
+            if failed_cards:
+                task.add_log(f"⚠️ 礼品卡应用结果: 成功 {len(successful_cards)} 张，失败 {len(failed_cards)} 张", "warning")
+                for failed_card in failed_cards:
+                    task.add_log(f"❌ 失败的礼品卡: {failed_card['number'][:4]}**** - {failed_card['error']}", "error")
+
+                # 如果有失败的礼品卡，返回False表示需要等待用户输入新的礼品卡
+                task.add_log("⏳ 有礼品卡应用失败，等待用户输入新的礼品卡...", "warning")
+                return False
+            else:
+                task.add_log("✅ 所有礼品卡应用成功", "success")
+                return True
+
+        except Exception as e:
+            task.add_log(f"❌ 应用提交的礼品卡失败: {str(e)}", "error")
             raise
 
     async def cleanup_task(self, task_id: str, force_close: bool = False):
@@ -3734,17 +4768,42 @@ class AutomationService:
                 logger.info(f"已关闭任务 {task_id} 的浏览器上下文")
             except Exception as e:
                 logger.warning(f"关闭浏览器上下文失败: {e}")
-    
+
+        # 清理任务特定的browser和playwright实例
+        if task_id in self.task_browsers:
+            try:
+                await self.task_browsers[task_id].close()
+                del self.task_browsers[task_id]
+            except Exception as e:
+                logger.warning(f"关闭任务 {task_id[:8]} browser失败: {e}")
+
+        if task_id in self.task_playwrights:
+            try:
+                await self.task_playwrights[task_id].stop()
+                del self.task_playwrights[task_id]
+            except Exception as e:
+                logger.warning(f"停止任务 {task_id[:8]} playwright失败: {e}")
+
     async def cleanup_all(self):
         """清理所有资源"""
         for task_id in list(self.contexts.keys()):
             await self.cleanup_task(task_id)
-            
-        if self.browser:
-            await self.browser.close()
-            
-        if self.playwright:
-            await self.playwright.stop()
+
+        # 清理所有任务的browser实例
+        for task_id, browser in list(self.task_browsers.items()):
+            try:
+                await browser.close()
+                del self.task_browsers[task_id]
+            except Exception as e:
+                logger.warning(f"关闭任务 {task_id[:8]} browser失败: {e}")
+
+        # 清理所有任务的playwright实例
+        for task_id, playwright in list(self.task_playwrights.items()):
+            try:
+                await playwright.stop()
+                del self.task_playwrights[task_id]
+            except Exception as e:
+                logger.warning(f"停止任务 {task_id[:8]} playwright失败: {e}")
 
     # ==================== 基于apple_automator.py的选择方法 ====================
 
@@ -4517,6 +5576,11 @@ class AutomationService:
                     "status": "0余额",
                     "message": "礼品卡余额为零",
                     "log_level": "warning"
+                },
+                "Please enter a valid PIN": {
+                    "status": "PIN错误",
+                    "message": "请输入有效的PIN码",
+                    "log_level": "error"
                 }
             }
 
@@ -4535,8 +5599,8 @@ class AutomationService:
             if detected_error and gift_card_number:
                 task.add_log(f"📝 更新礼品卡状态: {gift_card_number[:4]}**** -> {error_info['status']}", "warning")
 
-                # 更新数据库中的礼品卡状态
-                await self._update_gift_card_status_in_db(gift_card_number, error_info["status"])
+                # 🚀 新增：检查礼品卡是否存在于数据库中，如果不存在则创建
+                await self._ensure_gift_card_in_database(gift_card_number, error_info["status"], error_info["message"])
 
                 # 更新任务配置中的礼品卡状态
                 if hasattr(task.config, 'gift_cards') and task.config.gift_cards:
@@ -4549,22 +5613,128 @@ class AutomationService:
                 # 发送WebSocket通知前端更新礼品卡状态
                 await self._notify_gift_card_status_update(gift_card_number, error_info["status"], error_info["message"])
 
-                # 抛出异常以停止当前礼品卡的处理
-                raise Exception(f"礼品卡错误: {error_info['message']}")
-
-            # 如果没有检测到错误，说明礼品卡应用成功
-            if not detected_error:
-                task.add_log("✅ 礼品卡应用成功，未检测到错误", "success")
-
-                # 如果成功，更新为有额度状态
+                # 抛出异常以停止当前礼品卡的处理，包含礼品卡号
                 if gift_card_number:
-                    await self._update_gift_card_status_in_db(gift_card_number, "有额度")
-                    await self._notify_gift_card_status_update(gift_card_number, "有额度", "礼品卡应用成功")
+                    raise Exception(f"礼品卡 {gift_card_number[:4]}**** 错误: {error_info['message']}")
+                else:
+                    raise Exception(f"礼品卡错误: {error_info['message']}")
+
+            # 如果没有检测到明确的错误，需要严格验证是否真的成功
+            if not detected_error:
+                # 严格验证：检查URL是否跳转到下一个页面
+                current_url = page.url
+                task.add_log(f"🔍 当前页面URL: {current_url}", "info")
+
+                # 检查是否仍在礼品卡输入页面（说明没有成功跳转）
+                if self._is_still_on_gift_card_page(current_url, page_content):
+                    # 仍在礼品卡页面，说明有未检测到的错误
+                    task.add_log("❌ 礼品卡应用失败：页面未跳转，可能存在未检测到的错误", "error")
+
+                    # 尝试检测更多可能的错误消息
+                    additional_error = await self._detect_additional_gift_card_errors(page, page_content)
+                    if additional_error:
+                        error_message = additional_error
+                    else:
+                        error_message = "礼品卡应用失败，页面未跳转"
+
+                    # 发送错误事件到前端
+                    if gift_card_number:
+                        await self._ensure_gift_card_in_database(gift_card_number, "被充值", error_message)
+                        await self._notify_gift_card_status_update(gift_card_number, "被充值", error_message)
+
+                    # 包含礼品卡号的错误消息
+                    if gift_card_number:
+                        raise Exception(f"礼品卡 {gift_card_number[:4]}**** 错误: {error_message}")
+                    else:
+                        raise Exception(f"礼品卡错误: {error_message}")
+                else:
+                    # 页面已跳转，礼品卡应用成功
+                    task.add_log("✅ 礼品卡应用成功，页面已跳转到下一步", "success")
+
+                    # 如果成功，确保礼品卡存在于数据库并更新为有额度状态
+                    if gift_card_number:
+                        await self._ensure_gift_card_in_database(gift_card_number, "有额度", "礼品卡应用成功")
+                        await self._notify_gift_card_status_update(gift_card_number, "有额度", "礼品卡应用成功")
                     
         except Exception as e:
             task.add_log(f"⚠️ 礼品卡错误检测过程中出现异常: {e}", "warning")
             # 重新抛出异常让上层处理
             raise
+
+    def _is_still_on_gift_card_page(self, current_url: str, page_content: str) -> bool:
+        """检查是否仍在礼品卡输入页面"""
+        # URL检查：如果URL包含礼品卡相关路径，说明仍在礼品卡页面
+        gift_card_url_patterns = [
+            '/checkout/payment',
+            '/payment',
+            '/gift-card',
+            '/giftcard'
+        ]
+
+        for pattern in gift_card_url_patterns:
+            if pattern in current_url.lower():
+                # 进一步检查页面内容是否包含礼品卡输入元素
+                gift_card_content_patterns = [
+                    'gift card number',
+                    'gift card code',
+                    'enter your gift card',
+                    'apply gift card',
+                    'gift card pin'
+                ]
+
+                for content_pattern in gift_card_content_patterns:
+                    if content_pattern.lower() in page_content.lower():
+                        return True
+
+        return False
+
+    async def _detect_additional_gift_card_errors(self, page: Page, page_content: str) -> str:
+        """检测额外的礼品卡错误消息"""
+        # 检测更多可能的错误模式
+        additional_error_patterns = [
+            "invalid pin",
+            "incorrect pin",
+            "pin is incorrect",
+            "please check the pin",
+            "gift card not found",
+            "card not recognized",
+            "unable to process",
+            "payment method declined",
+            "card has been used",
+            "expired gift card"
+        ]
+
+        page_content_lower = page_content.lower()
+
+        for pattern in additional_error_patterns:
+            if pattern in page_content_lower:
+                return f"礼品卡错误: {pattern}"
+
+        # 尝试从页面中查找错误元素
+        try:
+            error_selectors = [
+                '[role="alert"]',
+                '.error-message',
+                '.alert-error',
+                '.notification-error',
+                '.form-error',
+                '.field-error'
+            ]
+
+            for selector in error_selectors:
+                elements = page.locator(selector)
+                count = await elements.count()
+
+                for i in range(count):
+                    element = elements.nth(i)
+                    if await element.is_visible():
+                        text = await element.text_content()
+                        if text and text.strip():
+                            return f"页面错误: {text.strip()}"
+        except:
+            pass
+
+        return "未知错误：礼品卡应用失败"
             
     async def _update_gift_card_status_in_db(self, gift_card_number: str, new_status: str):
         """更新数据库中的礼品卡状态"""
@@ -4594,32 +5764,16 @@ class AutomationService:
         except Exception as e:
             print(f"❌ 数据库更新失败: {e}")
 
-    async def _notify_gift_card_status_update(self, gift_card_number: str, new_status: str, message: str):
-        """通知前端礼品卡状态更新"""
-        import time
-
+    async def _ensure_gift_card_in_database(self, gift_card_number: str, status: str, message: str):
+        """确保礼品卡存在于数据库中，如果不存在则创建，如果存在则更新状态"""
         try:
-            # 发送WebSocket消息通知前端
-            if hasattr(self, 'message_service') and self.message_service:
-                self.message_service.publish('gift_card_status_update', {
-                    'gift_card_number': gift_card_number,
-                    'status': new_status,
-                    'message': message,
-                    'timestamp': time.time()
-                })
-                print(f"📡 已发送礼品卡状态更新通知: {gift_card_number[:4]}**** -> {new_status}")
+            from models.database import DatabaseManager
 
-            # 如果有WebSocket处理器，也发送更新
-            from app import websocket_handler
-            if websocket_handler:
-                websocket_handler.broadcast('gift_card_status_update', {
-                    'gift_card_number': gift_card_number,
-                    'status': new_status,
-                    'message': message,
-                    'timestamp': time.time()
-                })
+            db_manager = DatabaseManager()
 
-        except Exception as e:
-            print(f"❌ 发送礼品卡状态更新通知失败: {e}")
+            # 检查礼品卡是否已存在
+            existing_card = db_manager.get_gift_card_by_number(gift_card_number)
 
-    # =============
+            if existing_card:
+                # 礼品卡已存在，更新状态
+      

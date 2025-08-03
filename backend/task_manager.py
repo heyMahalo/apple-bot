@@ -374,4 +374,342 @@ class TaskManager:
         except Exception as e:
             logger.error(f"❌ Celery任务提交失败: {task.id} - {str(e)}")
             task.add_log(f"Celery任务提交失败: {str(e)}", "error")
-            return Fal
+            return False
+
+    def cancel_task(self, task_id: str, websocket_handler=None) -> bool:
+        """取消任务 - 支持所有活跃状态"""
+        task = self.get_task(task_id)
+        if not task:
+            return False
+
+        # 检查任务是否可以取消
+        cancellable_statuses = [
+            TaskStatus.RUNNING,
+            TaskStatus.STAGE_1_PRODUCT_CONFIG,
+            TaskStatus.STAGE_2_ACCOUNT_LOGIN,
+            TaskStatus.STAGE_3_ADDRESS_PHONE,
+            TaskStatus.STAGE_4_GIFT_CARD,
+            TaskStatus.WAITING_GIFT_CARD_INPUT
+        ]
+
+        if task.status in cancellable_statuses:
+            # 🚀 根据执行模式取消任务
+            if self.use_celery and task_id in self.celery_tasks:
+                # 取消Celery任务
+                try:
+                    celery_result = self.celery_tasks[task_id]
+                    celery_result.revoke(terminate=True)
+                    logger.info(f"🚀 Celery任务已取消: {task_id}")
+
+                    # 提交清理任务
+                    if self.cleanup_task_func:
+                        self.cleanup_task_func.delay(task_id)
+
+                except Exception as e:
+                    logger.error(f"❌ 取消Celery任务失败: {str(e)}")
+                finally:
+                    if task_id in self.celery_tasks:
+                        del self.celery_tasks[task_id]
+            else:
+                # 终止线程模式的异步任务
+                if hasattr(self, 'running_tasks') and task_id in self.running_tasks:
+                    try:
+                        async_task = self.running_tasks[task_id]
+                        async_task.cancel()
+                    except Exception as e:
+                        logger.error(f"终止异步任务失败: {str(e)}")
+                    finally:
+                        if task_id in self.running_tasks:
+                            del self.running_tasks[task_id]
+
+            self._update_task_status(task, TaskStatus.CANCELLED)
+            task.add_log("任务已取消")
+
+            # 通知WebSocket客户端任务状态更新
+            if websocket_handler:
+                websocket_handler.broadcast('task_update', task.to_dict())
+
+            logger.info(f"✅ 任务已取消: {task_id} ({'Celery' if self.use_celery else '线程'}模式)")
+
+        return True
+
+    def delete_task(self, task_id: str, websocket_handler=None) -> bool:
+        """删除任务并销毁所有相关资源"""
+        task = self.get_task(task_id)
+        if not task:
+            return False
+
+        logger.info(f"开始删除任务 {task_id}，状态: {task.status}")
+
+        # 如果任务正在运行或处于活跃状态，先取消它
+        active_statuses = [
+            TaskStatus.RUNNING,
+            TaskStatus.STAGE_1_PRODUCT_CONFIG,
+            TaskStatus.STAGE_2_ACCOUNT_LOGIN,
+            TaskStatus.STAGE_3_ADDRESS_PHONE,
+            TaskStatus.STAGE_4_GIFT_CARD,
+            TaskStatus.WAITING_GIFT_CARD_INPUT
+        ]
+        if task.status in active_statuses:
+            logger.info(f"任务 {task_id} 处于活跃状态，先取消任务")
+            self.cancel_task(task_id, websocket_handler)
+
+        # 🚀 重要：销毁浏览器资源（异步进行，不阻塞删除）
+        if self.use_celery and self.cleanup_task_func:
+            # 使用Celery异步清理
+            try:
+                self.cleanup_task_func.delay(task_id)
+                logger.info(f"🚀 Celery清理任务已提交: {task_id}")
+            except Exception as e:
+                logger.error(f"❌ Celery清理任务提交失败: {e}")
+                # 回退到线程清理
+                self._cleanup_task_resources(task_id)
+        else:
+            # 使用线程清理
+            self._cleanup_task_resources(task_id)
+
+        # 从任务列表中移除（即使资源清理失败也要删除任务）
+        if task_id in self.tasks:
+            del self.tasks[task_id]
+
+            # 🚀 从数据库中删除任务
+            try:
+                from models.database import DatabaseManager
+                db_manager = DatabaseManager()
+                db_deleted = db_manager.delete_task(task_id)
+                if db_deleted:
+                    logger.info(f"✅ 任务已从数据库删除: {task_id}")
+                else:
+                    logger.warning(f"⚠️ 数据库删除失败，但内存中的任务已删除: {task_id}")
+            except Exception as e:
+                logger.error(f"❌ 数据库删除任务失败: {task_id} - {e}")
+
+            # 通知WebSocket客户端任务已删除
+            if websocket_handler:
+                websocket_handler.broadcast('task_deleted', {'task_id': task_id})
+                # 发送删除成功事件给特定客户端
+                websocket_handler.emit('task_delete_success', {'task_id': task_id})
+
+            logger.info(f"✅ 任务 {task_id} 已完全删除，浏览器资源正在后台清理")
+            return True
+
+        logger.warning(f"⚠️ 任务 {task_id} 不存在于任务列表中")
+        return False
+
+    def _cleanup_task_resources(self, task_id: str):
+        """清理任务的浏览器资源"""
+        try:
+            if self.automation_service:
+                # 🚀 优化的异步资源清理
+                import asyncio
+                import threading
+                import signal
+                import sys
+
+                def cleanup_in_thread():
+                    """在新线程中运行异步清理"""
+                    try:
+                        # 创建新的事件循环，避免与主线程冲突
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                        # 设置信号处理器，避免事件循环错误
+                        if sys.platform != 'win32':
+                            # 在Unix系统上禁用信号处理器
+                            for sig in [signal.SIGINT, signal.SIGTERM]:
+                                try:
+                                    signal.signal(sig, signal.SIG_DFL)
+                                except (ValueError, OSError):
+                                    pass  # 忽略信号设置错误
+
+                        # 强制关闭浏览器资源
+                        loop.run_until_complete(
+                            self.automation_service.cleanup_task(task_id, force_close=True)
+                        )
+
+                        # 安全关闭事件循环
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass  # 忽略关闭错误
+
+                        logger.info(f"✅ 任务 {task_id} 的浏览器资源已清理")
+                    except Exception as e:
+                        logger.error(f"❌ 清理任务 {task_id} 的浏览器资源失败: {str(e)}")
+                        # 即使清理失败，也不影响任务删除
+
+                # 在后台线程中执行清理
+                cleanup_thread = threading.Thread(target=cleanup_in_thread, daemon=True)
+                cleanup_thread.start()
+
+                logger.info(f"🧹 已启动任务 {task_id} 的资源清理线程")
+            else:
+                logger.warning(f"⚠️ AutomationService 不可用，无法清理任务 {task_id} 的浏览器资源")
+
+        except Exception as e:
+            logger.error(f"❌ 清理任务 {task_id} 资源时发生错误: {str(e)}")
+            # 资源清理失败不应该影响任务删除
+
+    def _start_task_async(self, task: Task, websocket_handler=None) -> bool:
+        """同进程异步启动任务"""
+        try:
+            # 🚀 重要：设置WebSocket处理器到自动化服务
+            if self.automation_service and websocket_handler:
+                self.automation_service.set_websocket_handler(websocket_handler)
+                logger.info(f"✅ WebSocket处理器已设置到AutomationService")
+
+            # 创建异步任务
+            import asyncio
+            import threading
+            
+            def run_task_in_thread():
+                """在新线程中运行任务"""
+                try:
+                    # 运行任务 - 使用线程安全方法（内部管理事件循环）
+                    result = self.automation_service.execute_task_threadsafe(task)
+                    
+                    # 更新任务状态
+                    if result:
+                        if task.status != TaskStatus.WAITING_GIFT_CARD_INPUT:
+                            task.status = TaskStatus.COMPLETED
+                            task.completed_at = datetime.now()
+                        task.add_log("✅ 任务执行完成", "success")
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.add_log("❌ 任务执行失败", "error")
+                    
+                    # 🚀 通过Redis发送最终状态更新（100%同步）
+                    try:
+                        from services.message_service import get_message_service
+                        message_service = get_message_service()
+                        message_service.sync_task_status(
+                            task_id=task.id,
+                            status=task.status.value,
+                            progress=task.progress,
+                            message="任务执行完成" if result else "任务执行失败"
+                        )
+                        logger.info(f"✅ 最终任务状态已通过Redis同步: {task.id}")
+                    except Exception as redis_e:
+                        logger.warning(f"⚠️ Redis最终状态同步失败: {redis_e}")
+                    
+                    # 🚀 发送详细的完成状态更新
+                    if websocket_handler:
+                        websocket_handler.broadcast('task_status_update', {
+                            'task_id': task.id,
+                            'status': task.status.value,
+                            'progress': task.progress,
+                            'message': f"任务已完成"
+                        })
+                        # 向后兼容的通用更新事件
+                        websocket_handler.broadcast('task_update', task.to_dict())
+                    
+                except Exception as e:
+                    logger.error(f"任务执行异常: {str(e)}")
+                    task.status = TaskStatus.FAILED
+                    task.error_message = str(e)
+                    task.add_log(f"❌ 任务执行异常: {str(e)}", "error")
+                    
+                    # 🚀 通过Redis发送异常状态更新（100%同步）
+                    try:
+                        from services.message_service import get_message_service
+                        message_service = get_message_service()
+                        message_service.sync_task_status(
+                            task_id=task.id,
+                            status=task.status.value,
+                            progress=task.progress,
+                            message=f"任务执行异常: {str(e)}"
+                        )
+                    except Exception as redis_e:
+                        logger.warning(f"⚠️ Redis异常状态同步失败: {redis_e}")
+                    
+                    # 🚀 发送详细的失败状态更新
+                    if websocket_handler:
+                        websocket_handler.broadcast('task_status_update', {
+                            'task_id': task.id,
+                            'status': task.status.value,
+                            'progress': task.progress,
+                            'message': f"任务执行失败: {str(e)}"
+                        })
+                        # 向后兼容的通用更新事件
+                        websocket_handler.broadcast('task_update', task.to_dict())
+
+            # 启动线程
+            thread = threading.Thread(target=run_task_in_thread, daemon=True)
+            thread.start()
+            
+            return True
+
+        except Exception as e:
+            logger.error(f"启动任务失败: {str(e)}")
+            return False
+
+    def cleanup(self):
+        """清理资源"""
+        # 清理运行中的异步任务
+        if hasattr(self, 'running_tasks'):
+            for task_id, async_task in self.running_tasks.items():
+                try:
+                    async_task.cancel()
+                except Exception as e:
+                    logger.error(f"清理异步任务 {task_id} 失败: {str(e)}")
+            self.running_tasks.clear()
+
+    def reset_and_restart_task(self, task_id: str, websocket_handler=None) -> bool:
+        """重置并重新启动任务"""
+        task = self.get_task(task_id)
+        if not task:
+            logger.error(f"Task {task_id} not found for reset and restart")
+            return False
+        
+        try:
+            # 如果任务正在运行，先取消它
+            if task.status == TaskStatus.RUNNING:
+                logger.info(f"Cancelling running task {task_id} before reset")
+                self.cancel_task(task_id, websocket_handler)
+                # 等待取消完成
+                import time
+                time.sleep(1)
+            
+            # 重置任务状态和数据
+            logger.info(f"Resetting task {task_id} to initial state")
+            task.status = TaskStatus.PENDING
+            task.progress = 0
+            task.current_step = None
+            task.started_at = None
+            task.completed_at = None
+            task.error_message = None
+            task.logs = []
+            
+            # 清除礼品卡错误和余额错误
+            if hasattr(task, 'gift_card_errors'):
+                task.gift_card_errors = []
+            if hasattr(task, 'balance_error'):
+                task.balance_error = None
+            
+            task.add_log("任务已重置，准备重新启动")
+            
+            # 通知WebSocket客户端任务已重置
+            if websocket_handler:
+                websocket_handler.broadcast('task_update', task.to_dict())
+            
+            # 重新启动任务
+            logger.info(f"Restarting task {task_id}")
+            success = self.start_task(task_id, websocket_handler)
+            
+            if success:
+                logger.info(f"Successfully reset and restarted task {task_id}")
+                return True
+            else:
+                logger.error(f"Failed to restart task {task_id} after reset")
+                task.add_log("重启任务失败", "error")
+                if websocket_handler:
+                    websocket_handler.broadcast('task_update', task.to_dict())
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error resetting and restarting task {task_id}: {str(e)}")
+            task.status = TaskStatus.FAILED
+            task.add_log(f"重置任务失败: {str(e)}", "error")
+            if websocket_handler:
+                websocket_handler.broadcast('task_update', task.to_dict())
+            return False
